@@ -292,9 +292,6 @@ if [[ -z "$PYTHON_BIN" ]]; then
 fi
 log "Using Python: $PYTHON_BIN (azure-storage-blob available)"
 
-_ensure_raw_recordings_folder
-log "Azure container ready (raw-recordings/ folder ensured)"
-
 # ---- Singleton ---------------------------------------------------------
 if [[ -f "$PID_FILE" ]]; then
     _old=$(cat "$PID_FILE" 2>/dev/null || true)
@@ -576,6 +573,9 @@ _poll() {
 }
 
 # ---- Main loop ---------------------------------------------------------
+_ensure_raw_recordings_folder
+log "Azure container ready (raw-recordings/ folder ensured)"
+
 _poll  # immediate check on startup
 
 while true; do
