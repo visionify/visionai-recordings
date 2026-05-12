@@ -24,8 +24,8 @@
 #
 # ── Daemon env vars (set in ENV_FILE) ────────────────────────────────────────
 #   Required: VISIONAI_API_ENDPOINT  VISIONAI_API_TOKEN
-#             EVENTS_AZURE_BLOB_CONNECTION_STRING  EVENTS_AZURE_BLOB_CONTAINER
-#   Optional: POLL_INTERVAL (default 60s)  SEGMENT_DURATION (default 600s)
+#             EVENTS_AZURE_BLOB_CONNECTION_STRING
+#   Optional: POLL_INTERVAL (default 300s)
 #             UPLOAD_RETRIES (default 3)   UPLOAD_RETRY_DELAY (default 10s)
 #             PYTHON_BIN  DEBUG  ENV_FILE  LOG_FILE
 
@@ -229,8 +229,7 @@ fi
 # RECORDING MANAGER DAEMON  (default mode — invoked by systemd)
 # =============================================================================
 
-SEGMENT_DURATION=${SEGMENT_DURATION:-600}
-POLL_INTERVAL=${POLL_INTERVAL:-60}
+POLL_INTERVAL=${POLL_INTERVAL:-300}
 UPLOAD_RETRIES=${UPLOAD_RETRIES:-3}
 UPLOAD_RETRY_DELAY=${UPLOAD_RETRY_DELAY:-10}
 ENV_FILE=${ENV_FILE:-${HOME}/.visionai/.env}
@@ -252,10 +251,17 @@ log_debug() { [[ "${DEBUG:-0}" == "1" ]] && echo "[$(_ts)] [rec-mgr] DEBUG: $*" 
 _load_env() {
     local file="$1"
     while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue   # skip comments
-        [[ "$line" =~ ^[[:space:]]*$ ]] && continue   # skip blank lines
+        line="${line%%$'\r'}"                              # strip Windows \r
+        line="${line%"${line##*[! ]}"}"                    # strip trailing spaces
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue       # skip comments
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue       # skip blank lines
         [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]    || continue   # skip invalid
-        export "${line?}"
+        local _key="${line%%=*}"
+        local _val="${line#*=}"
+        # Strip matching surrounding double or single quotes
+        if [[ "$_val" == \"*\" ]]; then _val="${_val#\"}"; _val="${_val%\"}"; fi
+        if [[ "$_val" == \'*\' ]]; then _val="${_val#\'}"; _val="${_val%\'}"; fi
+        export "${_key}=${_val}"
     done < "$file"
 }
 if [[ -f "$ENV_FILE" ]]; then
@@ -268,7 +274,7 @@ fi
 _check_vars() {
     local missing=()
     for v in VISIONAI_API_ENDPOINT VISIONAI_API_TOKEN \
-              EVENTS_AZURE_BLOB_CONNECTION_STRING EVENTS_AZURE_BLOB_CONTAINER; do
+              EVENTS_AZURE_BLOB_CONNECTION_STRING; do
         [[ -z "${!v:-}" ]] && missing+=("$v")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -317,7 +323,7 @@ echo $$ > "$PID_FILE"
 trap 'rm -f "$PID_FILE"; log "Stopped (PID $$)"' EXIT INT TERM
 
 rm -f "${ACTIVE_DIR}"/* 2>/dev/null || true
-log "Started (PID=$$, poll=${POLL_INTERVAL}s, segment=${SEGMENT_DURATION}s)"
+log "Started (PID=$$, poll=${POLL_INTERVAL}s)"
 log "API endpoint: ${VISIONAI_API_ENDPOINT:-<NOT SET>}"
 if [[ -n "${VISIONAI_API_TOKEN:-}" ]]; then
     log "API token: set (${#VISIONAI_API_TOKEN} chars)"
@@ -343,25 +349,26 @@ _api_post() {
 # POST /v2/update-recording-url — covers in_progress, completed, failed
 _api_update() {
     local recording_id="$1" azure_url="$2" status="$3"
-    local start_time="${4:-}" stop_time="${5:-}" duration="${6:-0}" camera_id="${7:-}"
-    local body
+    local start_time="${4:-}" stop_time="${5:-}" duration="${6:-0}" camera_id="${7:-0}"
+    local body resp
     body=$(jq -n \
-        --arg  rid   "$recording_id" \
-        --arg  url   "$azure_url" \
-        --arg  st    "$status" \
-        --arg  start "$start_time" \
-        --arg  stop  "$stop_time" \
-        --argjson dur "$duration" \
-        --arg  cid   "$camera_id" \
+        --argjson rid "$recording_id" \
+        --arg     url "$azure_url" \
+        --arg     st  "$status" \
+        --arg     start "$start_time" \
+        --arg     stop  "$stop_time" \
+        --argjson dur   "$duration" \
+        --argjson cid   "$camera_id" \
         '{recording_id:$rid,azure_url:$url,status:$st,
           start_time:$start,stop_time:$stop,duration:$dur,camera_id:$cid}')
-    _api_post "${VISIONAI_API_ENDPOINT}/v2/update-recording-url" "$body" >/dev/null 2>&1 || true
+    resp=$(_api_post "${VISIONAI_API_ENDPOINT}/v2/update-recording-url" "$body" 2>/dev/null) || true
+    log_debug "Recording $recording_id: _api_update status=$status resp=${resp:0:120}"
 }
 
 # Claim recording by setting status to in_progress; returns 0 if claimed, 1 if rejected
 _api_start() {
     local rec_id="$1" cam_id="$2" start_time="$3"
-    local tmp code ok
+    local tmp code body ok
     tmp=$(mktemp)
     code=$(curl -s -o "$tmp" -w "%{http_code}" --max-time 10 -X POST \
         -H "Content-Type: application/json" \
@@ -373,46 +380,63 @@ _api_start() {
                 '{recording_id:$rid,camera_id:$cid,azure_url:"",
                   status:"in_progress",start_time:$start,stop_time:"",duration:0}')" \
         "${VISIONAI_API_ENDPOINT}/v2/update-recording-url")
-    ok=$(jq -r '.success // "false"' "$tmp" 2>/dev/null)
-    rm -f "$tmp"
-    [[ "$code" != "409" && "$ok" == "true" ]]
+    body=$(cat "$tmp" 2>/dev/null); rm -f "$tmp"
+    ok=$(echo "$body" | jq -r '.success // "false"' 2>/dev/null)
+    log_debug "Recording $rec_id: _api_start HTTP=$code body=${body:0:200}"
+    if [[ "$code" == "409" ]]; then
+        log "Recording $rec_id: claim rejected (409) — already claimed by another server"
+        return 1
+    fi
+    if [[ "$ok" != "true" ]]; then
+        log_warn "Recording $rec_id: claim failed (HTTP $code): ${body:0:300}"
+        return 1
+    fi
+    return 0
 }
 
-# ---- Ensure raw-recordings/ folder marker exists in the container ------
+# ---- Create raw-recordings container if it doesn't exist ---------------
 _ensure_raw_recordings_folder() {
-    "$PYTHON_BIN" - "$EVENTS_AZURE_BLOB_CONTAINER" \
-            "$EVENTS_AZURE_BLOB_CONNECTION_STRING" 2>/dev/null <<'PYEOF' || true
+    "$PYTHON_BIN" - "$EVENTS_AZURE_BLOB_CONNECTION_STRING" 2>/dev/null <<'PYEOF' || true
 import sys
 from azure.storage.blob import BlobServiceClient
-container, conn_str = sys.argv[1:]
+conn_str = sys.argv[1]
 client = BlobServiceClient.from_connection_string(conn_str)
-container_client = client.get_container_client(container)
-marker = "raw-recordings/.keep"
+container_client = client.get_container_client("raw-recordings")
 try:
-    container_client.get_blob_client(marker).get_blob_properties()
+    container_client.get_container_properties()
 except Exception:
-    container_client.get_blob_client(marker).upload_blob(b"", overwrite=False)
+    container_client.create_container()
+    print("Created container: raw-recordings")
 PYEOF
 }
 
-# ---- Upload file to Azure Blob Storage, return blob URL or empty -------
+# ---- Upload file to Azure Blob Storage, return SAS URL or empty --------
 _azure_upload() {
     local file="$1" blob_name="$2"
     local attempt=1
 
     while [[ $attempt -le $UPLOAD_RETRIES ]]; do
         local result
-        result=$("$PYTHON_BIN" - "$file" "$EVENTS_AZURE_BLOB_CONTAINER" \
+        result=$("$PYTHON_BIN" - "$file" "raw-recordings" \
                 "$blob_name" "$EVENTS_AZURE_BLOB_CONNECTION_STRING" 2>&1 <<'PYEOF'
 import sys
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from datetime import datetime, timedelta, timezone
 file_path, container, blob_name, conn_str = sys.argv[1:]
 try:
     client = BlobServiceClient.from_connection_string(conn_str)
     blob_client = client.get_blob_client(container=container, blob=blob_name)
     with open(file_path, "rb") as f:
         blob_client.upload_blob(f, overwrite=True)
-    print(blob_client.url)
+    sas_token = generate_blob_sas(
+        account_name=client.account_name,
+        container_name=container,
+        blob_name=blob_name,
+        account_key=client.credential.account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.now(timezone.utc) + timedelta(days=7),
+    )
+    print(f"{blob_client.url}?{sas_token}")
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr)
     sys.exit(1)
@@ -430,27 +454,32 @@ PYEOF
 
 _file_size() { stat -c%s "$1" 2>/dev/null || echo 0; }
 
-# ---- ffmpeg segment capture with deadline watchdog ---------------------
+# ---- ffmpeg capture with deadline watchdog; stderr saved to <out>.err ----
 _ffmpeg_record() {
     local rtsp="$1" out="$2" dur="$3"
+    local errfile="${out}.err"
     local deadline=$(( $(date +%s) + dur + 60 ))
 
     ffmpeg \
         -rtsp_transport tcp \
         -i "$rtsp" \
         -t "$dur" \
-        -c:v libx264 -preset ultrafast -crf 23 \
-        -c:a aac -b:a 128k \
+        -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease" \
+        -r 15 \
+        -c:v libx264 -preset medium -crf 20 \
+        -profile:v high -pix_fmt yuv420p \
+        -g 15 -keyint_min 15 -sc_threshold 0 \
+        -an \
         -movflags +faststart \
         -y "$out" \
-        >/dev/null 2>&1 &
+        >/dev/null 2>"$errfile" &
     local pid=$!
 
     while kill -0 "$pid" 2>/dev/null; do
         sleep 5
         if [[ $(date +%s) -gt $deadline ]]; then
             kill "$pid" 2>/dev/null || true
-            log_warn "ffmpeg deadline exceeded for $out, killed"
+            log_warn "ffmpeg deadline exceeded for $out — killed"
             break
         fi
     done
@@ -474,64 +503,46 @@ _upload_thumb() {
 _run_recording() {
     trap - EXIT INT TERM  # don't inherit parent PID-file cleanup trap
 
-    local rec_id="$1" cam_id="$2" cam_name="$3" dur_sec="$4" rtsp="$5"
+    local rec_id="$1" cam_id="$2" cam_name="$3" dur_sec="$4" rtsp="$5" site_name="${6:-unknown-site}"
     local cam_safe; cam_safe=$(echo "$cam_name" \
         | tr '[:upper:]' '[:lower:]' | tr ' /' '--' | tr -cd 'a-z0-9_-')
-    local rec_ts; rec_ts=$(date '+%Y%m%d-%H%M%S')
+    local site_safe; site_safe=$(echo "$site_name" \
+        | tr '[:upper:]' '[:lower:]' | tr ' /' '--' | tr -cd 'a-z0-9_-')
+    local rec_date; rec_date=$(date '+%Y-%m-%d')
+    local rec_ts; rec_ts=$(date '+%H%M%S')
     local start_time; start_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    local base="raw-recordings/${cam_safe}"
-    local total=$dur_sec elapsed=0 idx=0 last_url=""
+    local rec_file="${TMP_DIR}/rec_${rec_id}.mp4"
+    local blob_path="${site_safe}/${rec_date}/${cam_safe}-${rec_ts}.mp4"
+    local thumb_path="${site_safe}/${rec_date}/${cam_safe}-${rec_ts}_thumb.jpg"
 
-    log "Recording $rec_id: starting (cam=$cam_name, ${dur_sec}s, path=$base)"
+    log "Recording $rec_id: starting (cam=$cam_name, site=$site_name, ${dur_sec}s)"
 
-    if ! _api_start "$rec_id" "$cam_id" "$start_time"; then
-        log "Recording $rec_id: already claimed by another server — skip"
-        rm -f "${ACTIVE_DIR}/${rec_id}"
+    _ffmpeg_record "$rtsp" "$rec_file" "$dur_sec"
+
+    if [[ ! -s "$rec_file" ]]; then
+        local ffmpeg_err
+        ffmpeg_err=$(grep -v "^$" "${rec_file}.err" 2>/dev/null | tail -5 | tr '\n' ' ')
+        log_error "Recording $rec_id: ffmpeg failed for camera '$cam_name' (${rtsp%%@*}) — ${ffmpeg_err:-no output}"
+        _api_update "$rec_id" "" "failed" "$start_time" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$dur_sec" "$cam_id"
+        rm -f "$rec_file" "${rec_file}.err" "${ACTIVE_DIR}/${rec_id}"
         return
     fi
 
-    while [[ $elapsed -lt $total ]]; do
-        local seg_dur=$(( SEGMENT_DURATION < (total - elapsed) ? SEGMENT_DURATION : (total - elapsed) ))
-        local idx_fmt; idx_fmt=$(printf "%03d" "$idx")
-        local seg_file="${TMP_DIR}/rec_${rec_id}_${idx_fmt}.mp4"
+    local sz; sz=$(_file_size "$rec_file")
+    log "Recording $rec_id: ffmpeg done (${sz}B), uploading..."
 
-        _ffmpeg_record "$rtsp" "$seg_file" "$seg_dur"
-
-        if [[ -s "$seg_file" ]]; then
-            local sz; sz=$(_file_size "$seg_file")
-            local fname="${cam_safe}-${rec_ts}-${idx_fmt}"
-            local url; url=$(_azure_upload "$seg_file" "${base}/${fname}.mp4") || url=""
-            local thumb; thumb=$(_upload_thumb "$seg_file" "${base}/${fname}_thumb.jpg") || thumb=""
-            rm -f "$seg_file"
-
-            if [[ -n "$url" ]]; then
-                last_url="$url"
-                local now; now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-                _api_update "$rec_id" "$last_url" "in_progress" \
-                    "$start_time" "$now" "$(( elapsed + seg_dur ))" "$cam_id"
-                log "Recording $rec_id: segment $idx_fmt uploaded (${sz}B)"
-            else
-                log_warn "Recording $rec_id: segment $idx_fmt upload failed — skipping"
-            fi
-        else
-            log_warn "Recording $rec_id: segment $idx_fmt missing or empty"
-            rm -f "$seg_file"
-        fi
-
-        elapsed=$(( elapsed + seg_dur ))
-        idx=$(( idx + 1 ))
-    done
+    local url; url=$(_azure_upload "$rec_file" "$blob_path") || url=""
+    local thumb; thumb=$(_upload_thumb "$rec_file" "$thumb_path") || thumb=""
+    rm -f "$rec_file" "${rec_file}.err"
 
     local stop_time; stop_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
-    if [[ -n "$last_url" ]]; then
-        _api_update "$rec_id" "$last_url" "completed" \
-            "$start_time" "$stop_time" "$total" "$cam_id"
-        log "Recording $rec_id: completed"
+    if [[ -n "$url" ]]; then
+        _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$dur_sec" "$cam_id"
+        log "Recording $rec_id: completed — $blob_path (${sz}B)"
     else
-        _api_update "$rec_id" "" "failed" \
-            "$start_time" "$stop_time" "$total" "$cam_id"
-        log_error "Recording $rec_id: failed — no segments uploaded successfully"
+        _api_update "$rec_id" "" "failed" "$start_time" "$stop_time" "$dur_sec" "$cam_id"
+        log_error "Recording $rec_id: upload failed"
     fi
 
     rm -f "${ACTIVE_DIR}/${rec_id}"
@@ -545,12 +556,13 @@ _dispatch() {
 
     for i in $(seq 0 $(( n - 1 ))); do
         local rec; rec=$(echo "$json" | jq ".[$i]")
-        local rec_id cam_id cam_name rtsp dur_sec
-        rec_id=$(echo "$rec"   | jq -r '.recording_id       // empty')
-        cam_id=$(echo "$rec"   | jq -r '.camera_id          // empty')
-        cam_name=$(echo "$rec" | jq -r '.camera_name        // .camera_id // empty')
-        rtsp=$(echo "$rec"     | jq -r '.camera_url         // empty')
-        dur_sec=$(echo "$rec"  | jq -r '.recording_duration // 3600')
+        local rec_id cam_id cam_name site_name rtsp dur_sec
+        rec_id=$(echo "$rec"    | jq -r '.recording_id       // empty')
+        cam_id=$(echo "$rec"    | jq -r '.camera_id          // empty')
+        cam_name=$(echo "$rec"  | jq -r '.camera_name        // .camera_id // empty')
+        site_name=$(echo "$rec" | jq -r '.site_name          // empty')
+        rtsp=$(echo "$rec"      | jq -r '.camera_url         // empty')
+        dur_sec=$(echo "$rec"   | jq -r '.recording_duration // 3600')
 
         if [[ -z "$rec_id" || -z "$rtsp" ]]; then
             log_warn "Skipping invalid entry (missing recording_id or camera_url): $rec"
@@ -562,8 +574,8 @@ _dispatch() {
         fi
 
         touch "${ACTIVE_DIR}/${rec_id}"
-        log "Recording $rec_id: dispatching (cam=$cam_name, ${dur_sec}s)"
-        _run_recording "$rec_id" "$cam_id" "$cam_name" "$dur_sec" "$rtsp" &
+        log "Recording $rec_id: dispatching (cam=$cam_name, site=$site_name, ${dur_sec}s)"
+        _run_recording "$rec_id" "$cam_id" "$cam_name" "$dur_sec" "$rtsp" "$site_name" &
         dispatched=$(( dispatched + 1 ))
     done
 
@@ -580,6 +592,24 @@ _poll() {
         -H "Token: $VISIONAI_API_TOKEN" \
         "${VISIONAI_API_ENDPOINT}/v2/get-recording-status?recording_type=raw")
     resp=$(cat "$tmp"); rm -f "$tmp"
+
+    # 000 = curl couldn't connect at all (bad endpoint, no network, empty var)
+    if [[ "$http_code" == "000" ]]; then
+        log_error "API unreachable (HTTP 000) — check VISIONAI_API_ENDPOINT and network — retry in ${POLL_INTERVAL}s"
+        return
+    fi
+
+    # API returns 404 + "No active recordings found" when the queue is empty
+    if [[ "$http_code" == "404" ]]; then
+        local msg; msg=$(echo "$resp" | jq -r '.message // ""' 2>/dev/null)
+        if echo "$msg" | grep -qi "no active recording"; then
+            log "No pending recordings"
+            return
+        fi
+        log_error "API error (HTTP 404): ${resp:0:200} — retry in ${POLL_INTERVAL}s"
+        return
+    fi
+
     if [[ "$http_code" != "200" ]]; then
         log_error "API error (HTTP $http_code): ${resp:0:200} — retry in ${POLL_INTERVAL}s"
         return
