@@ -24,7 +24,7 @@
 #
 # ── Daemon env vars (set in ENV_FILE) ────────────────────────────────────────
 #   Required: VISIONAI_API_ENDPOINT  VISIONAI_API_TOKEN
-#             AZURE_STORAGE_CONNECTION_STRING  AZURE_CONTAINER_NAME
+#             EVENTS_AZURE_BLOB_CONNECTION_STRING  EVENTS_AZURE_BLOB_CONTAINER
 #   Optional: POLL_INTERVAL (default 60s)  SEGMENT_DURATION (default 600s)
 #             UPLOAD_RETRIES (default 3)   UPLOAD_RETRY_DELAY (default 10s)
 #             PYTHON_BIN  DEBUG  ENV_FILE  LOG_FILE
@@ -254,7 +254,7 @@ log_debug() { [[ "${DEBUG:-0}" == "1" ]] && echo "[$(_ts)] [rec-mgr] DEBUG: $*" 
 _check_vars() {
     local missing=()
     for v in VISIONAI_API_ENDPOINT VISIONAI_API_TOKEN \
-              AZURE_STORAGE_CONNECTION_STRING AZURE_CONTAINER_NAME; do
+              EVENTS_AZURE_BLOB_CONNECTION_STRING EVENTS_AZURE_BLOB_CONTAINER; do
         [[ -z "${!v:-}" ]] && missing+=("$v")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -291,6 +291,9 @@ if [[ -z "$PYTHON_BIN" ]]; then
     exit 1
 fi
 log "Using Python: $PYTHON_BIN (azure-storage-blob available)"
+
+_ensure_raw_recordings_folder
+log "Azure container ready (raw-recordings/ folder ensured)"
 
 # ---- Singleton ---------------------------------------------------------
 if [[ -f "$PID_FILE" ]]; then
@@ -358,6 +361,23 @@ _api_start() {
     [[ "$code" != "409" && "$ok" == "true" ]]
 }
 
+# ---- Ensure raw-recordings/ folder marker exists in the container ------
+_ensure_raw_recordings_folder() {
+    "$PYTHON_BIN" - "$EVENTS_AZURE_BLOB_CONTAINER" \
+            "$EVENTS_AZURE_BLOB_CONNECTION_STRING" 2>/dev/null <<'PYEOF' || true
+import sys
+from azure.storage.blob import BlobServiceClient
+container, conn_str = sys.argv[1:]
+client = BlobServiceClient.from_connection_string(conn_str)
+container_client = client.get_container_client(container)
+marker = "raw-recordings/.keep"
+try:
+    container_client.get_blob_client(marker).get_blob_properties()
+except Exception:
+    container_client.get_blob_client(marker).upload_blob(b"", overwrite=False)
+PYEOF
+}
+
 # ---- Upload file to Azure Blob Storage, return blob URL or empty -------
 _azure_upload() {
     local file="$1" blob_name="$2"
@@ -365,8 +385,8 @@ _azure_upload() {
 
     while [[ $attempt -le $UPLOAD_RETRIES ]]; do
         local result
-        result=$("$PYTHON_BIN" - "$file" "$AZURE_CONTAINER_NAME" \
-                "$blob_name" "$AZURE_STORAGE_CONNECTION_STRING" 2>&1 <<'PYEOF'
+        result=$("$PYTHON_BIN" - "$file" "$EVENTS_AZURE_BLOB_CONTAINER" \
+                "$blob_name" "$EVENTS_AZURE_BLOB_CONNECTION_STRING" 2>&1 <<'PYEOF'
 import sys
 from azure.storage.blob import BlobServiceClient
 file_path, container, blob_name, conn_str = sys.argv[1:]
@@ -435,7 +455,7 @@ _run_recording() {
         | tr '[:upper:]' '[:lower:]' | tr ' /' '--' | tr -cd 'a-z0-9_-')
     local rec_ts; rec_ts=$(date '+%Y%m%d-%H%M%S')
     local start_time; start_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    local base="recordings/${cam_safe}"
+    local base="raw-recordings/${cam_safe}"
     local total=$dur_sec elapsed=0 idx=0 last_url=""
 
     log "Recording $rec_id: starting (cam=$cam_name, ${dur_sec}s, path=$base)"
