@@ -565,7 +565,7 @@ _poll() {
     http_code=$(curl -s -o "$tmp" -w "%{http_code}" --max-time 10 \
         -H "Content-Type: application/json" \
         -H "Token: $VISIONAI_API_TOKEN" \
-        "${VISIONAI_API_ENDPOINT}/api/v2/get-recording-status?recording_type=raw")
+        "${VISIONAI_API_ENDPOINT}/v2/get-recording-status?recording_type=raw")
     resp=$(cat "$tmp"); rm -f "$tmp"
     if [[ "$http_code" != "200" ]]; then
         log_error "API error (HTTP $http_code): ${resp:0:200} — retry in ${POLL_INTERVAL}s"
