@@ -319,7 +319,11 @@ trap 'rm -f "$PID_FILE"; log "Stopped (PID $$)"' EXIT INT TERM
 rm -f "${ACTIVE_DIR}"/* 2>/dev/null || true
 log "Started (PID=$$, poll=${POLL_INTERVAL}s, segment=${SEGMENT_DURATION}s)"
 log "API endpoint: ${VISIONAI_API_ENDPOINT:-<NOT SET>}"
-log "API token: ${VISIONAI_API_TOKEN:+set (${#VISIONAI_API_TOKEN} chars)}${VISIONAI_API_TOKEN:-<NOT SET>}"
+if [[ -n "${VISIONAI_API_TOKEN:-}" ]]; then
+    log "API token: set (${#VISIONAI_API_TOKEN} chars)"
+else
+    log "API token: <NOT SET>"
+fi
 
 # ---- API helpers -------------------------------------------------------
 _api_get() {
@@ -529,7 +533,7 @@ _run_recording() {
 # ---- Dispatch a list of recording objects ------------------------------
 _dispatch() {
     local json="$1"
-    local n; n=$(echo "$json" | jq 'length')
+    local n; n=$(echo "$json" | jq 'length' 2>/dev/null); n=${n:-0}
     local dispatched=0
 
     for i in $(seq 0 $(( n - 1 ))); do
@@ -588,7 +592,7 @@ _poll() {
         log_error "Unexpected API response: ${resp:0:200}"; return
     fi
 
-    local n; n=$(echo "$recs" | jq 'length')
+    local n; n=$(echo "$recs" | jq 'length' 2>/dev/null); n=${n:-0}
     [[ "$n" -eq 0 ]] && { log "No pending recordings"; return; }
     log "Found $n pending recording(s)"
     _dispatch "$recs"
