@@ -435,7 +435,14 @@ _ffmpeg_record() {
     local rtsp="$1" out="$2" dur="$3"
     local deadline=$(( $(date +%s) + dur + 60 ))
 
-    ffmpeg -rtsp_transport tcp -i "$rtsp" -t "$dur" -c:v copy -an -y "$out" \
+    ffmpeg \
+        -rtsp_transport tcp \
+        -i "$rtsp" \
+        -t "$dur" \
+        -c:v libx264 -preset ultrafast -crf 23 \
+        -c:a aac -b:a 128k \
+        -movflags +faststart \
+        -y "$out" \
         >/dev/null 2>&1 &
     local pid=$!
 
