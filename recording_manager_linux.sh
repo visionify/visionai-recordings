@@ -248,9 +248,22 @@ log_warn()  { echo "[$(_ts)] [rec-mgr] WARN: $*" >&2; }
 log_error() { echo "[$(_ts)] [rec-mgr] ERROR: $*" >&2; }
 log_debug() { [[ "${DEBUG:-0}" == "1" ]] && echo "[$(_ts)] [rec-mgr] DEBUG: $*" >&2 || true; }
 
-# shellcheck disable=SC1090
-[[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; log "Loaded $ENV_FILE"; } \
-    || log_warn "Env file not found at $ENV_FILE — using existing environment"
+# Safer env loader — only exports lines matching KEY=VALUE, skips comments/blanks
+_load_env() {
+    local file="$1"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue   # skip comments
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue   # skip blank lines
+        [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]    || continue   # skip invalid
+        export "${line?}"
+    done < "$file"
+}
+if [[ -f "$ENV_FILE" ]]; then
+    _load_env "$ENV_FILE"
+    log "Loaded $ENV_FILE"
+else
+    log_warn "Env file not found at $ENV_FILE — using existing environment"
+fi
 
 _check_vars() {
     local missing=()
@@ -547,11 +560,17 @@ _dispatch() {
 # ---- Normalise GET response, then dispatch ----------------------------
 _poll() {
     log "Polling for pending recordings..."
-    local resp
-    resp=$(_api_get \
-        "${VISIONAI_API_ENDPOINT}/v2/get-recording-status?recording_type=raw" \
-        10 2>/dev/null) \
-        || { log_error "API unreachable — retry in ${POLL_INTERVAL}s"; return; }
+    local resp http_code tmp
+    tmp=$(mktemp)
+    http_code=$(curl -s -o "$tmp" -w "%{http_code}" --max-time 10 \
+        -H "Content-Type: application/json" \
+        -H "Authorization: $VISIONAI_API_TOKEN" \
+        "${VISIONAI_API_ENDPOINT}/api/v2/get-recording-status?recording_type=raw")
+    resp=$(cat "$tmp"); rm -f "$tmp"
+    if [[ "$http_code" != "200" ]]; then
+        log_error "API error (HTTP $http_code): ${resp:0:200} — retry in ${POLL_INTERVAL}s"
+        return
+    fi
 
     # Support: { data:[...] }  { data:{...} }  [...]  {...}
     local recs
