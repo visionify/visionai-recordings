@@ -323,7 +323,7 @@ _api_post() {
         -d "$2" "$1"
 }
 
-# POST /api/v2/update-recording-url — covers in_progress, completed, failed
+# POST /v2/update-recording-url — covers in_progress, completed, failed
 _api_update() {
     local recording_id="$1" azure_url="$2" status="$3"
     local start_time="${4:-}" stop_time="${5:-}" duration="${6:-0}" camera_id="${7:-}"
@@ -338,7 +338,7 @@ _api_update() {
         --arg  cid   "$camera_id" \
         '{recording_id:$rid,azure_url:$url,status:$st,
           start_time:$start,stop_time:$stop,duration:$dur,camera_id:$cid}')
-    _api_post "${VISIONAI_API_ENDPOINT}/api/v2/update-recording-url" "$body" >/dev/null 2>&1 || true
+    _api_post "${VISIONAI_API_ENDPOINT}/v2/update-recording-url" "$body" >/dev/null 2>&1 || true
 }
 
 # Claim recording by setting status to in_progress; returns 0 if claimed, 1 if rejected
@@ -355,7 +355,7 @@ _api_start() {
                 --arg start "$start_time" \
                 '{recording_id:$rid,camera_id:$cid,azure_url:"",
                   status:"in_progress",start_time:$start,stop_time:"",duration:0}')" \
-        "${VISIONAI_API_ENDPOINT}/api/v2/update-recording-url")
+        "${VISIONAI_API_ENDPOINT}/v2/update-recording-url")
     ok=$(jq -r '.success // "false"' "$tmp" 2>/dev/null)
     rm -f "$tmp"
     [[ "$code" != "409" && "$ok" == "true" ]]
@@ -551,7 +551,7 @@ _poll() {
     log "Polling for pending recordings..."
     local resp
     resp=$(_api_get \
-        "${VISIONAI_API_ENDPOINT}/api/v2/get-recording-status?recording_type=raw" \
+        "${VISIONAI_API_ENDPOINT}/v2/get-recording-status?recording_type=raw" \
         10 2>/dev/null) \
         || { log_error "API unreachable — retry in ${POLL_INTERVAL}s"; return; }
 
