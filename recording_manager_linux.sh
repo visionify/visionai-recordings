@@ -8,11 +8,11 @@
 # ── Install ──────────────────────────────────────────────────────────────────
 #
 #   curl -fsSL https://raw.githubusercontent.com/visionify/visionai-recordings/main/recording_manager_linux.sh \
-#     | sudo bash -s -- install
+#     | sudo bash -s install
 #
 # With a custom .env file path (default: ~/.visionai/.env):
 #
-#   curl -fsSL ... | sudo ENV_FILE=/path/to/.env bash -s -- install
+#   curl -fsSL ... | sudo bash -s install ENV_FILE=/path/to/.env
 #
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 #
@@ -34,7 +34,7 @@ set -uo pipefail
 # =============================================================================
 # INSTALLER  (only runs when first arg is "install")
 # =============================================================================
-if [[ "${1:-}" == "install" ]]; then
+if [[ "${1:-}" == "install" || "${1:-}" == "--install" ]]; then
 
     REPO_URL="https://raw.githubusercontent.com/visionify/visionai-recordings/main/recording_manager_linux.sh"
     INSTALL_BIN="/usr/local/bin/visionai-recording-manager"
