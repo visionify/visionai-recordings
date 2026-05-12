@@ -318,6 +318,8 @@ trap 'rm -f "$PID_FILE"; log "Stopped (PID $$)"' EXIT INT TERM
 
 rm -f "${ACTIVE_DIR}"/* 2>/dev/null || true
 log "Started (PID=$$, poll=${POLL_INTERVAL}s, segment=${SEGMENT_DURATION}s)"
+log "API endpoint: ${VISIONAI_API_ENDPOINT:-<NOT SET>}"
+log "API token: ${VISIONAI_API_TOKEN:+set (${#VISIONAI_API_TOKEN} chars)}${VISIONAI_API_TOKEN:-<NOT SET>}"
 
 # ---- API helpers -------------------------------------------------------
 _api_get() {
