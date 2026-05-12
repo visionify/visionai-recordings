@@ -310,14 +310,14 @@ log "Started (PID=$$, poll=${POLL_INTERVAL}s, segment=${SEGMENT_DURATION}s)"
 _api_get() {
     curl -sf --max-time "${2:-10}" \
         -H "Content-Type: application/json" \
-        -H "x-api-token: $VISIONAI_API_TOKEN" \
+        -H "Authorization: $VISIONAI_API_TOKEN" \
         "$1"
 }
 
 _api_post() {
     curl -sf --max-time 10 -X POST \
         -H "Content-Type: application/json" \
-        -H "x-api-token: $VISIONAI_API_TOKEN" \
+        -H "Authorization: $VISIONAI_API_TOKEN" \
         -d "$2" "$1"
 }
 
@@ -346,7 +346,7 @@ _api_start() {
     tmp=$(mktemp)
     code=$(curl -s -o "$tmp" -w "%{http_code}" --max-time 10 -X POST \
         -H "Content-Type: application/json" \
-        -H "x-api-token: $VISIONAI_API_TOKEN" \
+        -H "Authorization: $VISIONAI_API_TOKEN" \
         -d "$(jq -n \
                 --arg rid   "$rec_id" \
                 --arg cid   "$cam_id" \
