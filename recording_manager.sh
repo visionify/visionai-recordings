@@ -59,6 +59,19 @@ for _cmd in jq ffmpeg curl; do
     command -v "$_cmd" >/dev/null 2>&1 || { log_error "$_cmd not found — install it first"; exit 1; }
 done
 
+# ---- Pick a video encoder: VideoToolbox if available, else libx264 ----
+# Bitrate-targeted (500k / 800k cap) for predictable file sizes —
+# ~37MB per 10-min segment vs ~150MB with stream-copy. Down-scale
+# anything wider than 720p so we don't waste bits on detail the
+# uplink can't carry.
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q '^[[:space:]]*V[^ ]*[[:space:]]\+h264_videotoolbox'; then
+    VIDEO_ENCODER_ARGS=(-c:v h264_videotoolbox -b:v 500k -maxrate 800k -bufsize 1200k)
+    log "Video encoder: h264_videotoolbox (hardware, ~500 kbps target)"
+else
+    VIDEO_ENCODER_ARGS=(-c:v libx264 -preset veryfast -b:v 500k -maxrate 800k -bufsize 1200k)
+    log_warn "h264_videotoolbox not available — using libx264 software encoder"
+fi
+
 # ---- Locate a Python 3 with boto3 -------------------------------------
 _find_python() {
     # Prefer PYTHON_BIN if set in env
@@ -112,34 +125,81 @@ _api_patch() {
 }
 
 # ---- Upload file to S3 via boto3, return presigned GET URL or empty ---
+# Mirrors the inference repo's upload_media() pattern
+# (utils/s3_bucket.py): 1MB multipart chunks, single-threaded,
+# fail-fast internally (max_attempts=1) and rely on this outer
+# retry loop. Small chunks minimise bytes lost when the uplink
+# drops mid-part — the previous 8MB chunks failed repeatedly on
+# this site's flaky connection.
 _s3_upload() {
     local file="$1" key="$2"
     local attempt=1
+    local stderr_file; stderr_file=$(mktemp)
 
     while [[ $attempt -le $UPLOAD_RETRIES ]]; do
-        local result err
+        local result rc
         result=$("$PYTHON_BIN" - "$file" "$AWS_BUCKET_NAME" "$key" \
-                "$AWS_REGION" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" 2>&1 <<'PYEOF'
-import sys, boto3
+                "$AWS_REGION" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
+                2>"$stderr_file" <<'PYEOF'
+import sys, os, warnings, mimetypes
+warnings.filterwarnings("ignore")
+import boto3
+from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
 from botocore.exceptions import BotoCoreError, ClientError
+
 file, bucket, key, region, ak, sk = sys.argv[1:]
 try:
-    s3 = boto3.client('s3', aws_access_key_id=ak, aws_secret_access_key=sk, region_name=region)
-    s3.upload_file(file, bucket, key)
-    url = s3.generate_presigned_url('get_object',
-              Params={'Bucket': bucket, 'Key': key}, ExpiresIn=604800)
+    cfg = Config(
+        signature_version="s3v4",
+        region_name=region,
+        retries={"max_attempts": 1, "mode": "standard"},
+        connect_timeout=60,
+        read_timeout=600,
+        tcp_keepalive=True,
+        user_agent_extra="visionai-recording-manager",
+    )
+    s3 = boto3.client("s3",
+                      aws_access_key_id=ak, aws_secret_access_key=sk,
+                      region_name=region, config=cfg)
+    # 1MB chunks + single-threaded — same as the inference uploader.
+    # On flaky links, smaller chunks mean each network blip costs
+    # at most 1MB instead of 8MB.
+    tcfg = TransferConfig(
+        multipart_threshold=1 * 1024 * 1024,
+        multipart_chunksize=1 * 1024 * 1024,
+        max_concurrency=1,
+        use_threads=False,
+    )
+    content_type = mimetypes.guess_type(file)[0] or "application/octet-stream"
+    with open(file, "rb") as f:
+        s3.upload_fileobj(
+            f, bucket, key,
+            ExtraArgs={"ContentType": content_type, "ACL": "private"},
+            Config=tcfg,
+        )
+    url = s3.generate_presigned_url("get_object",
+              Params={"Bucket": bucket, "Key": key}, ExpiresIn=604800)
     print(url)
 except (BotoCoreError, ClientError, Exception) as e:
     print(f"ERROR: {e}", file=sys.stderr)
     sys.exit(1)
 PYEOF
-        ) && { echo "$result"; return; }
+        )
+        rc=$?
+        if [[ $rc -eq 0 ]]; then
+            rm -f "$stderr_file"
+            echo "$result"
+            return
+        fi
 
-        log_warn "S3 upload failed for $key (attempt $attempt/$UPLOAD_RETRIES): ${result}" >&2
+        local err; err=$(tr '\n' ' ' < "$stderr_file")
+        log_warn "S3 upload failed for $key (attempt $attempt/$UPLOAD_RETRIES): ${err}" >&2
         attempt=$(( attempt + 1 ))
         [[ $attempt -le $UPLOAD_RETRIES ]] && sleep "$UPLOAD_RETRY_DELAY"
     done
 
+    rm -f "$stderr_file"
     log_error "S3 upload permanently failed for $key after $UPLOAD_RETRIES attempts" >&2
     echo ""
 }
@@ -212,7 +272,10 @@ _ffmpeg_record() {
     local rtsp="$1" out="$2" dur="$3"
     local deadline=$(( $(date +%s) + dur + 60 ))
 
-    ffmpeg -rtsp_transport tcp -i "$rtsp" -t "$dur" -c:v copy -an -y "$out" \
+    ffmpeg -rtsp_transport tcp -i "$rtsp" -t "$dur" \
+        -vf "scale='min(1280,iw)':-2" \
+        "${VIDEO_ENCODER_ARGS[@]}" \
+        -an -movflags +faststart -y "$out" \
         >/dev/null 2>&1 &
     local pid=$!
 
@@ -297,7 +360,11 @@ _run_recording() {
             jq --argjson e "$entry" '. + [$e]' "$segs" > "${segs}.tmp" \
                 && mv "${segs}.tmp" "$segs"
             _push_segments "$rec_id" "${last_url:-}" "$segs"
-            log "Recording $rec_id: segment $idx_fmt uploaded (${sz}B)"
+            if [[ -n "$url" ]]; then
+                log "Recording $rec_id: segment $idx_fmt uploaded (${sz}B)"
+            else
+                log_warn "Recording $rec_id: segment $idx_fmt UPLOAD FAILED — recorded locally was ${sz}B but no S3 URL"
+            fi
         else
             log_warn "Recording $rec_id: segment $idx_fmt missing or empty"
             rm -f "$seg_file"

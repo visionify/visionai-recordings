@@ -91,6 +91,35 @@ _require ffmpeg
 _require aws awscli
 _require curl
 
+# ── Verify ffmpeg has VideoToolbox (hardware H.264 encoder) ──────────────────
+# VideoToolbox is built into macOS — the recording script uses
+# h264_videotoolbox for low-CPU, real-time encoding at ~500 kbps.
+# Homebrew's ffmpeg always ships with it; static/conda builds often
+# don't. If the installed ffmpeg lacks it, reinstall via Homebrew.
+_has_videotoolbox() {
+    ffmpeg -hide_banner -encoders 2>/dev/null \
+        | grep -q '^[[:space:]]*V[^ ]*[[:space:]]\+h264_videotoolbox'
+}
+
+step "Verifying VideoToolbox encoder in ffmpeg..."
+if _has_videotoolbox; then
+    ok "h264_videotoolbox  available  ($(command -v ffmpeg))"
+else
+    warn "ffmpeg at $(command -v ffmpeg) lacks h264_videotoolbox — reinstalling via Homebrew..."
+    if [[ -n "$BREW_BIN" ]]; then
+        sudo -u "$BREW_USER" "$BREW_BIN" reinstall ffmpeg </dev/null \
+            || sudo -u "$BREW_USER" "$BREW_BIN" install ffmpeg </dev/null
+        hash -r 2>/dev/null || true
+        if _has_videotoolbox; then
+            ok "h264_videotoolbox  now available"
+        else
+            warn "h264_videotoolbox still missing — recording will fall back to libx264 (software, higher CPU)"
+        fi
+    else
+        warn "Homebrew not found — cannot reinstall ffmpeg. Recording will fall back to libx264 (software, higher CPU)"
+    fi
+fi
+
 # ── Env file ─────────────────────────────────────────────────────────────────
 step "Locating env file..."
 ENV_FILE="${ENV_FILE:-}"
