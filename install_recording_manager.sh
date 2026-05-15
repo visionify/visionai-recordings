@@ -4,7 +4,7 @@
 # Installs visionai-recording-manager as a macOS LaunchDaemon that:
 #   • starts automatically at boot
 #   • restarts on crash
-#   • polls the VisionAI API every 10 minutes to start camera recordings
+#   • polls the VisionAI API every 5 minutes to start camera recordings
 #
 # ── Install (same pattern as Homebrew) ───────────────────────────────────────
 #

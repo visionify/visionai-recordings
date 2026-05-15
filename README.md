@@ -100,7 +100,7 @@ recordings/<camera>/<camera>-<YYYYMMDD-HHMMSS>-001.mp4
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `POLL_INTERVAL` | `600` | Seconds between API polls |
+| `POLL_INTERVAL` | `300` | Seconds between API polls |
 | `SEGMENT_DURATION` | `600` | Seconds per video segment |
 | `UPLOAD_RETRIES` | `3` | Max S3 upload attempts per segment |
 | `UPLOAD_RETRY_DELAY` | `10` | Seconds between upload retries |

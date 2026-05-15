@@ -10,7 +10,7 @@
 #   AWS_ACCESS_KEY_ID  AWS_SECRET_ACCESS_KEY  AWS_REGION  AWS_BUCKET_NAME
 # Optional:
 #   SERVER_ID          - filter recordings to this server only
-#   POLL_INTERVAL      - seconds between polls (default: 600)
+#   POLL_INTERVAL      - seconds between polls (default: 300)
 #   SEGMENT_DURATION   - seconds per recording segment (default: 600)
 #   UPLOAD_RETRIES     - max upload attempts per segment (default: 3)
 #   UPLOAD_RETRY_DELAY - seconds between upload retries (default: 10)
@@ -21,7 +21,7 @@
 set -uo pipefail
 
 SEGMENT_DURATION=${SEGMENT_DURATION:-600}
-POLL_INTERVAL=${POLL_INTERVAL:-600}
+POLL_INTERVAL=${POLL_INTERVAL:-300}
 UPLOAD_RETRIES=${UPLOAD_RETRIES:-3}
 UPLOAD_RETRY_DELAY=${UPLOAD_RETRY_DELAY:-10}
 ENV_FILE=${ENV_FILE:-${HOME}/.visionai/.env}
