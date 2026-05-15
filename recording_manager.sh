@@ -141,7 +141,7 @@ _s3_upload() {
         result=$("$PYTHON_BIN" - "$file" "$AWS_BUCKET_NAME" "$key" \
                 "$AWS_REGION" "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" \
                 2>"$stderr_file" <<'PYEOF'
-import sys, os, warnings, mimetypes
+import sys, os, warnings, mimetypes, fcntl
 warnings.filterwarnings("ignore")
 import boto3
 from botocore.config import Config
@@ -150,6 +150,13 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 file, bucket, key, region, ak, sk = sys.argv[1:]
 try:
+    # Serialize uploads across all concurrent recordings — one
+    # segment uploads at a time, so multiple cameras hitting a
+    # segment boundary together don't fight for the uplink. The
+    # lock is released automatically when this process exits.
+    lock_fp = open("/tmp/visionai-rec/s3-upload.lock", "a+")
+    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+
     cfg = Config(
         signature_version="s3v4",
         region_name=region,
@@ -293,7 +300,11 @@ _ffmpeg_record() {
 # ---- Upload first frame as thumbnail, echo presigned URL or empty -----
 _upload_thumb() {
     local seg="$1" s3_key="$2"
-    local tmp; tmp=$(mktemp /tmp/visionai_th_XXXXXX.jpg)
+    # Derive tmp path from seg filename (already unique per recording+segment).
+    # macOS mktemp only substitutes trailing X's, so the previous
+    # `mktemp /tmp/visionai_th_XXXXXX.jpg` template raced and collided
+    # under concurrent recordings — see "mkstemp failed: File exists" logs.
+    local tmp="${TMP_DIR}/$(basename "$seg" .mp4)_thumb.jpg"
     ffmpeg -i "$seg" -frames:v 1 -f image2 -y "$tmp" >/dev/null 2>&1 || true
     if [[ -s "$tmp" ]]; then
         _s3_upload "$tmp" "$s3_key"
