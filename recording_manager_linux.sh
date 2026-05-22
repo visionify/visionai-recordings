@@ -462,6 +462,8 @@ _ffmpeg_record() {
 
     ffmpeg \
         -rtsp_transport tcp \
+        -stimeout 10000000 \
+        -timeout 10000000 \
         -i "$rtsp" \
         -t "$dur" \
         -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease,format=yuv420p" \
