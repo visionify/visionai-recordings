@@ -540,16 +540,36 @@ _run_recording() {
 
     log "Recording $rec_id: starting (cam=$cam_name, site=$site_name, ${dur_sec}s)"
 
-    _ffmpeg_record "$rtsp" "$rec_file" "$dur_sec"
+    local min_dur=$(( dur_sec / 2 ))
+    local attempt=0 max_attempts=3 remaining="$dur_sec"
 
-    if [[ ! -s "$rec_file" ]]; then
-        local ffmpeg_err
-        ffmpeg_err=$(grep -v "^$" "${rec_file}.err" 2>/dev/null | tail -5 | tr '\n' ' ')
-        log_error "Recording $rec_id: ffmpeg failed for camera '$cam_name' (${rtsp%%@*}) — ${ffmpeg_err:-no output}"
-        _api_update "$rec_id" "" "failed" "$start_time" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$dur_sec" "$cam_id"
-        rm -f "$rec_file" "${rec_file}.err" "${ACTIVE_DIR}/${rec_id}"
-        return
-    fi
+    while (( attempt < max_attempts && remaining > min_dur )); do
+        attempt=$(( attempt + 1 ))
+        _ffmpeg_record "$rtsp" "$rec_file" "$remaining"
+
+        if [[ ! -s "$rec_file" ]]; then
+            local ffmpeg_err
+            ffmpeg_err=$(grep -v "^$" "${rec_file}.err" 2>/dev/null | tail -5 | tr '\n' ' ')
+            log_error "Recording $rec_id: ffmpeg failed for camera '$cam_name' (${rtsp%%@*}) — ${ffmpeg_err:-no output}"
+            _api_update "$rec_id" "" "failed" "$start_time" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$dur_sec" "$cam_id"
+            rm -f "$rec_file" "${rec_file}.err" "${ACTIVE_DIR}/${rec_id}"
+            return
+        fi
+
+        local actual_dur
+        actual_dur=$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$rec_file" 2>/dev/null | cut -d. -f1)
+        actual_dur=${actual_dur:-0}
+
+        if (( actual_dur >= min_dur )); then
+            break
+        fi
+
+        log_warn "Recording $rec_id: short recording (${actual_dur}s/${remaining}s), attempt $attempt/$max_attempts — retrying"
+        remaining=$(( remaining - actual_dur ))
+        rm -f "$rec_file" "${rec_file}.err"
+        sleep 5
+    done
 
     local sz; sz=$(_file_size "$rec_file")
     log "Recording $rec_id: ffmpeg done (${sz}B), uploading..."
