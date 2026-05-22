@@ -485,10 +485,11 @@ _ffmpeg_record() {
         -i "$rtsp" \
         -t "$dur" \
         -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p" \
-        -r 15 \
-        -c:v libx264 -preset medium -crf 20 \
+        -r 5 \
+        -c:v libx264 -preset medium -crf 26 \
+        -maxrate 400k -bufsize 800k \
         -profile:v high -pix_fmt yuv420p \
-        -g 15 -keyint_min 15 -sc_threshold 0 \
+        -g 5 -keyint_min 5 -sc_threshold 0 \
         -an \
         -movflags +faststart \
         -y "$out"
