@@ -466,27 +466,11 @@ _detect_rtsp_timeout() {
 }
 
 # ---- ffmpeg capture with deadline watchdog; stderr saved to <out>.err ----
-_ffmpeg_record() {
-    local rtsp="$1" out="$2" dur="$3"
-    local errfile="${out}.err"
-    local deadline=$(( $(date +%s) + dur + 60 ))
+_ffmpeg_run() {
+    local out="$1" dur="$2" errfile="$3" deadline="$4"
+    shift 4
 
-    _detect_rtsp_timeout
-
-    ffmpeg \
-        -rtsp_transport tcp \
-        $_RTSP_TIMEOUT_FLAG \
-        -i "$rtsp" \
-        -t "$dur" \
-        -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease,format=yuv420p" \
-        -r 15 \
-        -c:v libx264 -preset medium -crf 20 \
-        -profile:v high -pix_fmt yuv420p \
-        -g 15 -keyint_min 15 -sc_threshold 0 \
-        -an \
-        -movflags +faststart \
-        -y "$out" \
-        >/dev/null 2>"$errfile" &
+    "$@" >/dev/null 2>"$errfile" &
     local pid=$!
 
     while kill -0 "$pid" 2>/dev/null; do
@@ -498,6 +482,46 @@ _ffmpeg_record() {
         fi
     done
     wait "$pid" 2>/dev/null || true
+}
+
+_ffmpeg_record() {
+    local rtsp="$1" out="$2" dur="$3"
+    local errfile="${out}.err"
+    local deadline=$(( $(date +%s) + dur + 60 ))
+
+    _detect_rtsp_timeout
+
+    # Try transcoding (resize + re-encode)
+    _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" \
+        ffmpeg \
+        -rtsp_transport tcp \
+        $_RTSP_TIMEOUT_FLAG \
+        -i "$rtsp" \
+        -t "$dur" \
+        -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease,format=yuv420p" \
+        -r 15 \
+        -c:v libx264 -preset medium -crf 20 \
+        -profile:v high -pix_fmt yuv420p \
+        -g 15 -keyint_min 15 -sc_threshold 0 \
+        -an \
+        -movflags +faststart \
+        -y "$out"
+
+    # Fallback to codec copy if transcoding produced no output
+    if [[ ! -s "$out" ]]; then
+        log_warn "Transcode failed for $out — retrying with codec copy"
+        deadline=$(( $(date +%s) + dur + 60 ))
+        _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" \
+            ffmpeg \
+            -rtsp_transport tcp \
+            $_RTSP_TIMEOUT_FLAG \
+            -i "$rtsp" \
+            -t "$dur" \
+            -c:v copy \
+            -an \
+            -movflags +faststart \
+            -y "$out"
+    fi
 }
 
 # ---- Upload first frame as thumbnail, echo blob URL or empty ----------
