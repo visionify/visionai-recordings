@@ -454,15 +454,28 @@ PYEOF
 
 _file_size() { stat -c%s "$1" 2>/dev/null || echo 0; }
 
+# ---- Detect RTSP timeout flag (runs once, caches result) ----
+_RTSP_TIMEOUT_FLAG=""
+_rtsp_timeout_detected=false
+_detect_rtsp_timeout() {
+    if $_rtsp_timeout_detected; then return; fi
+    _rtsp_timeout_detected=true
+    if ffmpeg -h demuxer=rtsp 2>&1 | grep -q '^\s*-timeout'; then
+        _RTSP_TIMEOUT_FLAG="-timeout 10000000"
+    fi
+}
+
 # ---- ffmpeg capture with deadline watchdog; stderr saved to <out>.err ----
 _ffmpeg_record() {
     local rtsp="$1" out="$2" dur="$3"
     local errfile="${out}.err"
     local deadline=$(( $(date +%s) + dur + 60 ))
 
+    _detect_rtsp_timeout
+
     ffmpeg \
         -rtsp_transport tcp \
-        -timeout 10000000 \
+        $_RTSP_TIMEOUT_FLAG \
         -i "$rtsp" \
         -t "$dur" \
         -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease,format=yuv420p" \
