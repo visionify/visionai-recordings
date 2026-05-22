@@ -454,17 +454,6 @@ PYEOF
 
 _file_size() { stat -c%s "$1" 2>/dev/null || echo 0; }
 
-# ---- Detect RTSP timeout flag (runs once, caches result) ----
-_RTSP_TIMEOUT_FLAG=""
-_rtsp_timeout_detected=false
-_detect_rtsp_timeout() {
-    if $_rtsp_timeout_detected; then return; fi
-    _rtsp_timeout_detected=true
-    if ffmpeg -h demuxer=rtsp 2>&1 | grep -q '^\s*-timeout'; then
-        _RTSP_TIMEOUT_FLAG="-timeout 10000000"
-    fi
-}
-
 # ---- ffmpeg capture with deadline watchdog; stderr saved to <out>.err ----
 _ffmpeg_run() {
     local out="$1" dur="$2" errfile="$3" deadline="$4"
@@ -489,13 +478,10 @@ _ffmpeg_record() {
     local errfile="${out}.err"
     local deadline=$(( $(date +%s) + dur + 60 ))
 
-    _detect_rtsp_timeout
-
     # Try transcoding (resize + re-encode)
     _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" \
         ffmpeg \
         -rtsp_transport tcp \
-        $_RTSP_TIMEOUT_FLAG \
         -i "$rtsp" \
         -t "$dur" \
         -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p" \
@@ -514,7 +500,6 @@ _ffmpeg_record() {
         _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" \
             ffmpeg \
             -rtsp_transport tcp \
-            $_RTSP_TIMEOUT_FLAG \
             -i "$rtsp" \
             -t "$dur" \
             -c:v copy \
