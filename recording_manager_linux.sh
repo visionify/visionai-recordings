@@ -464,7 +464,7 @@ _ffmpeg_record() {
         -rtsp_transport tcp \
         -i "$rtsp" \
         -t "$dur" \
-        -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease" \
+        -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease,format=yuv420p" \
         -r 15 \
         -c:v libx264 -preset medium -crf 20 \
         -profile:v high -pix_fmt yuv420p \
