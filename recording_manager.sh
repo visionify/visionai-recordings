@@ -30,7 +30,13 @@ TMP_DIR=/tmp/visionai-rec
 ACTIVE_DIR=$TMP_DIR/active
 PID_FILE=/var/run/visionai-recording-manager.pid
 
-mkdir -p "$(dirname "$LOG_FILE")" "$TMP_DIR" "$ACTIVE_DIR"
+# Re-create the working dirs every time they're needed: macOS's periodic
+# /tmp reaper deletes files under /tmp that haven't been touched in ~3 days,
+# so a long-running daemon can't rely on a one-time mkdir at startup.
+_ensure_tmp_dirs() { mkdir -p "$TMP_DIR" "$ACTIVE_DIR" 2>/dev/null || true; }
+
+mkdir -p "$(dirname "$LOG_FILE")"
+_ensure_tmp_dirs
 exec >> "$LOG_FILE" 2>&1
 
 _ts()       { date '+%Y-%m-%d %H:%M:%S'; }
@@ -317,6 +323,7 @@ _upload_thumb() {
 # ---- Full recording lifecycle (invoked as a background subprocess) ----
 _run_recording() {
     trap - EXIT INT TERM  # don't inherit the parent's PID-file cleanup trap
+    _ensure_tmp_dirs      # this runs in a subshell; guarantee dirs before mktemp/ffmpeg
 
     local rec_id="$1" cam_id="$2" cam_name="$3" dur_min="$4" rtsp="$5"
     # Sanitise camera name for use as an S3 path component
@@ -436,6 +443,7 @@ _dispatch() {
 
 # ---- Poll the API for pending recordings and dispatch them ------------
 _poll() {
+    _ensure_tmp_dirs   # re-create dirs in case the OS reaped them since last poll
     log "Polling for pending recordings..."
     local resp
     resp=$(_api_get "${VISIONAI_API_ENDPOINT}/recordings/inference?action=pending" 10 \
