@@ -28,6 +28,19 @@
 #   Optional: POLL_INTERVAL (default 300s)
 #             UPLOAD_RETRIES (default 3)   UPLOAD_RETRY_DELAY (default 10s)
 #             PYTHON_BIN  DEBUG  ENV_FILE  LOG_FILE
+#
+#   Site scoping — resolved automatically from /v2/token-context (site_uuid,
+#   site_name). These optional .env vars override the API values if set:
+#             VISIONAI_SITE_UUID  VISIONAI_FIREBASE_PATH  VISIONAI_SITE_NAME
+#
+#   Firebase push (optional — enables near-instant start/stop instead of waiting
+#   for the next poll; falls back to polling when unset or unavailable):
+#             FIREBASE_DATABASE_URL  (Realtime DB URL — required to enable push)
+#     Service account, either:
+#             FIREBASE_SERVICE_ACCOUNT  (path to service-account JSON), or the
+#             individual fields used by the backend:
+#             FIREBASE_PROJECT_ID  FIREBASE_PRIVATE_KEY_ID  FIREBASE_PRIVATE_KEY
+#             FIREBASE_CLIENT_EMAIL  FIREBASE_CLIENT_ID  FIREBASE_CLIENT_X509_CERT_URL
 
 set -uo pipefail
 
@@ -115,6 +128,20 @@ if [[ "${1:-}" == "install" || "${1:-}" == "--install" ]]; then
         ok "azure-storage-blob installed"
     fi
 
+    # firebase-admin enables the optional push listener (near-instant start/stop).
+    # Non-fatal: if it can't be installed, the daemon just runs in polling-only mode.
+    if "$VENV_DIR/bin/python3" -c "import firebase_admin" 2>/dev/null; then
+        ok "firebase-admin already installed"
+    else
+        warn "Installing firebase-admin into venv (optional — enables push start/stop)..."
+        if "$VENV_DIR/bin/pip" install --quiet firebase-admin 2>/dev/null \
+            && "$VENV_DIR/bin/python3" -c "import firebase_admin" 2>/dev/null; then
+            ok "firebase-admin installed"
+        else
+            warn "firebase-admin install failed — daemon will run in polling-only mode"
+        fi
+    fi
+
     # ── Env file ──────────────────────────────────────────────────────────────
     step "Locating env file..."
     ENV_FILE="${ENV_FILE:-}"
@@ -175,6 +202,7 @@ Type=simple
 ExecStart=/bin/bash ${INSTALL_BIN}
 Restart=always
 RestartSec=10
+TimeoutStopSec=20
 Environment=ENV_FILE=${ENV_FILE}
 Environment=LOG_FILE=${LOG_DIR}/recording-manager.log
 Environment=PYTHON_BIN=${VENV_DIR}/bin/python3
@@ -237,6 +265,16 @@ LOG_FILE=${LOG_FILE:-/var/log/visionai/recording-manager.log}
 TMP_DIR=/tmp/visionai-rec
 ACTIVE_DIR=$TMP_DIR/active
 PID_FILE=/var/run/visionai-recording-manager.pid
+LISTENER_SCRIPT=$TMP_DIR/firebase_listener.py
+FIREBASE_RESTART_DELAY=${FIREBASE_RESTART_DELAY:-15}
+# Azure Blob layout: <container>/<prefix>/<site_uuid>/<camera>-<timestamp>.mp4
+AZURE_CONTAINER=${AZURE_CONTAINER:-recordings}
+AZURE_BLOB_PREFIX=${AZURE_BLOB_PREFIX:-raw-recordings}
+# Resolved at startup from /v2/token-context (the token is opaque to us).
+CLIENT_SITE_ID=""
+CLIENT_SITE_NAME=""
+CLIENT_SITE_UUID=""
+CLIENT_FIREBASE_PATH=""   # recording-commands/{site_uuid} — listener scope
 
 mkdir -p "$(dirname "$LOG_FILE")" "$TMP_DIR" "$ACTIVE_DIR"
 exec >> "$LOG_FILE" 2>&1
@@ -312,6 +350,38 @@ if [[ -z "$PYTHON_BIN" ]]; then
 fi
 log "Using Python: $PYTHON_BIN (azure-storage-blob available)"
 
+# ---- Locate a Python 3 with firebase_admin (optional push listener) -----
+# Returns a python path with firebase_admin importable, or "" if none.
+_find_python_firebase() {
+    for _py in "$PYTHON_BIN" \
+        /opt/visionai/.venv/bin/python3 \
+        /home/visionify/.venv/bin/python3 \
+        /home/visionify/visionai/.venv/bin/python3 \
+        /usr/local/bin/python3 \
+        python3 python; do
+        [[ -n "$_py" ]] || continue
+        [[ -x "$_py" ]] || command -v "$_py" >/dev/null 2>&1 || continue
+        "$_py" -c "import firebase_admin" 2>/dev/null && { echo "$_py"; return; }
+    done
+    echo ""
+}
+
+# Firebase is enabled only when a DB URL is set AND a python with firebase_admin
+# exists. Otherwise the daemon runs polling-only (mirrors the backend fallback).
+FIREBASE_PYTHON=""
+FIREBASE_ENABLED=0
+if [[ -n "${FIREBASE_DATABASE_URL:-}" ]]; then
+    FIREBASE_PYTHON=$(_find_python_firebase)
+    if [[ -n "$FIREBASE_PYTHON" ]]; then
+        FIREBASE_ENABLED=1
+        log "Firebase push enabled (python=$FIREBASE_PYTHON, db=${FIREBASE_DATABASE_URL})"
+    else
+        log_warn "FIREBASE_DATABASE_URL set but firebase_admin not importable — polling only. Run: pip3 install firebase-admin"
+    fi
+else
+    log "Firebase disabled (FIREBASE_DATABASE_URL not set) — polling only"
+fi
+
 # ---- Singleton ---------------------------------------------------------
 if [[ -f "$PID_FILE" ]]; then
     _old=$(cat "$PID_FILE" 2>/dev/null || true)
@@ -320,9 +390,19 @@ if [[ -f "$PID_FILE" ]]; then
     fi
 fi
 echo $$ > "$PID_FILE"
-trap 'rm -f "$PID_FILE"; log "Stopped (PID $$)"' EXIT INT TERM
+_cleanup() {
+    rm -f "$PID_FILE"
+    [[ -n "${FIREBASE_LOOP_PID:-}" ]] && kill "$FIREBASE_LOOP_PID" 2>/dev/null || true
+    pkill -f "$LISTENER_SCRIPT" 2>/dev/null || true
+    log "Stopped (PID $$)"
+}
+# On a signal, exit promptly (don't resume the poll loop) — that turns the EXIT
+# trap into the single cleanup path and lets `systemctl stop/restart` finish in
+# ~1s instead of waiting out TimeoutStopSec before SIGKILL.
+trap _cleanup EXIT
+trap 'exit 0' INT TERM
 
-rm -f "${ACTIVE_DIR}"/* 2>/dev/null || true
+rm -rf "${ACTIVE_DIR:?}"/* 2>/dev/null || true
 log "Started (PID=$$, poll=${POLL_INTERVAL}s)"
 log "API endpoint: ${VISIONAI_API_ENDPOINT:-<NOT SET>}"
 if [[ -n "${VISIONAI_API_TOKEN:-}" ]]; then
@@ -365,48 +445,56 @@ _api_update() {
     log_debug "Recording $recording_id: _api_update status=$status resp=${resp:0:120}"
 }
 
-# Claim recording by setting status to in_progress; returns 0 if claimed, 1 if rejected
-_api_start() {
-    local rec_id="$1" cam_id="$2" start_time="$3"
-    local tmp code body ok
-    tmp=$(mktemp)
-    code=$(curl -s -o "$tmp" -w "%{http_code}" --max-time 10 -X POST \
-        -H "Content-Type: application/json" \
-        -H "Token: $VISIONAI_API_TOKEN" \
-        -d "$(jq -n \
-                --arg rid   "$rec_id" \
-                --arg cid   "$cam_id" \
-                --arg start "$start_time" \
-                '{recording_id:$rid,camera_id:$cid,azure_url:"",
-                  status:"in_progress",start_time:$start,stop_time:"",duration:0}')" \
-        "${VISIONAI_API_ENDPOINT}/v2/update-recording-url")
-    body=$(cat "$tmp" 2>/dev/null); rm -f "$tmp"
-    ok=$(echo "$body" | jq -r '.success // "false"' 2>/dev/null)
-    log_debug "Recording $rec_id: _api_start HTTP=$code body=${body:0:200}"
-    if [[ "$code" == "409" ]]; then
-        log "Recording $rec_id: claim rejected (409) — already claimed by another server"
-        return 1
+# NOTE: dedup is local — the atomic `mkdir "$ACTIVE_DIR/<rec_id>"` claim in
+# _dispatch_one guarantees a single recording per id within THIS daemon. There
+# is no cross-machine claim (update-recording-url never returns 409), so run
+# exactly one daemon per site_uuid; two daemons on the same site would each
+# record and upload the same recording.
+
+# Resolve the Firebase listener path and labelling from /v2/token-context (the
+# token is opaque to us). The backend pushes commands to
+# recording-commands/{site_uuid}/{recording_id}; token-context returns site_uuid
+# (listener scope), site_name (Azure folder label) and site_id (safety filter).
+# .env values may override any of these; without a uuid the listener falls back
+# to the unscoped root path and relies on the site_id filter.
+_fetch_site_context() {
+    local resp
+    resp=$(_api_get "${VISIONAI_API_ENDPOINT}/v2/token-context" 10 2>/dev/null) || resp=""
+    if [[ -n "$resp" ]]; then
+        CLIENT_SITE_ID=$(echo "$resp"   | jq -r '.site_id   // empty' 2>/dev/null)
+        CLIENT_SITE_NAME=$(echo "$resp" | jq -r '.site_name // empty' 2>/dev/null)
+        CLIENT_SITE_UUID=$(echo "$resp" | jq -r '.site_uuid // empty' 2>/dev/null)
+    else
+        log_warn "/v2/token-context unavailable — check VISIONAI_API_ENDPOINT/TOKEN"
     fi
-    if [[ "$ok" != "true" ]]; then
-        log_warn "Recording $rec_id: claim failed (HTTP $code): ${body:0:300}"
-        return 1
+
+    # Optional .env overrides (API is normally the source of truth).
+    [[ -n "${VISIONAI_SITE_UUID:-}" ]] && CLIENT_SITE_UUID="$VISIONAI_SITE_UUID"
+    [[ -n "${VISIONAI_SITE_NAME:-}" ]] && CLIENT_SITE_NAME="$VISIONAI_SITE_NAME"
+
+    # site_uuid drives both the Firebase listener path and the Azure blob layout.
+    [[ -n "$CLIENT_SITE_UUID"           ]] && CLIENT_FIREBASE_PATH="recording-commands/${CLIENT_SITE_UUID}"
+    [[ -n "${VISIONAI_FIREBASE_PATH:-}" ]] && CLIENT_FIREBASE_PATH="$VISIONAI_FIREBASE_PATH"
+
+    if [[ -z "$CLIENT_FIREBASE_PATH" ]]; then
+        log_warn "No site_uuid resolved — Firebase listener will use the unscoped root path (filtering by site_id)"
     fi
-    return 0
+    log "Firebase: path=${CLIENT_FIREBASE_PATH:-<root>} site_uuid=${CLIENT_SITE_UUID:-<none>} site_id=${CLIENT_SITE_ID:-<none>} site_name=${CLIENT_SITE_NAME:-<none>}"
 }
 
-# ---- Create raw-recordings container if it doesn't exist ---------------
-_ensure_raw_recordings_folder() {
-    "$PYTHON_BIN" - "$EVENTS_AZURE_BLOB_CONNECTION_STRING" 2>/dev/null <<'PYEOF' || true
+# ---- Create the recordings container if it doesn't exist ---------------
+_ensure_container() {
+    "$PYTHON_BIN" - "$EVENTS_AZURE_BLOB_CONNECTION_STRING" "$AZURE_CONTAINER" 2>/dev/null <<'PYEOF' || true
 import sys
 from azure.storage.blob import BlobServiceClient
-conn_str = sys.argv[1]
+conn_str, container = sys.argv[1:3]
 client = BlobServiceClient.from_connection_string(conn_str)
-container_client = client.get_container_client("raw-recordings")
+container_client = client.get_container_client(container)
 try:
     container_client.get_container_properties()
 except Exception:
     container_client.create_container()
-    print("Created container: raw-recordings")
+    print(f"Created container: {container}")
 PYEOF
 }
 
@@ -417,7 +505,7 @@ _azure_upload() {
 
     while [[ $attempt -le $UPLOAD_RETRIES ]]; do
         local result
-        result=$("$PYTHON_BIN" - "$file" "raw-recordings" \
+        result=$("$PYTHON_BIN" - "$file" "$AZURE_CONTAINER" \
                 "$blob_name" "$EVENTS_AZURE_BLOB_CONNECTION_STRING" 2>&1 <<'PYEOF'
 import sys
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
@@ -455,15 +543,23 @@ PYEOF
 _file_size() { stat -c%s "$1" 2>/dev/null || echo 0; }
 
 # ---- ffmpeg capture with deadline watchdog; stderr saved to <out>.err ----
+# A non-empty $stopflag path that appears mid-capture triggers a graceful stop
+# (SIGTERM) so an in-progress recording can be ended early on command. ffmpeg
+# finalizes the moov atom on SIGTERM (+faststart), yielding a playable partial.
 _ffmpeg_run() {
-    local out="$1" dur="$2" errfile="$3" deadline="$4"
-    shift 4
+    local out="$1" dur="$2" errfile="$3" deadline="$4" stopflag="${5:-}"
+    shift 5
 
     "$@" >/dev/null 2>"$errfile" &
     local pid=$!
 
     while kill -0 "$pid" 2>/dev/null; do
-        sleep 5
+        sleep 2
+        if [[ -n "$stopflag" && -f "$stopflag" ]]; then
+            kill "$pid" 2>/dev/null || true
+            log "ffmpeg stop requested for $out — ending early"
+            break
+        fi
         if [[ $(date +%s) -gt $deadline ]]; then
             kill "$pid" 2>/dev/null || true
             log_warn "ffmpeg deadline exceeded for $out — killed"
@@ -474,12 +570,12 @@ _ffmpeg_run() {
 }
 
 _ffmpeg_record() {
-    local rtsp="$1" out="$2" dur="$3"
+    local rtsp="$1" out="$2" dur="$3" stopflag="${4:-}"
     local errfile="${out}.err"
     local deadline=$(( $(date +%s) + dur + 60 ))
 
     # Try transcoding (resize + re-encode)
-    _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" \
+    _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" "$stopflag" \
         ffmpeg \
         -rtsp_transport tcp \
         -i "$rtsp" \
@@ -494,11 +590,13 @@ _ffmpeg_record() {
         -movflags +faststart \
         -y "$out"
 
-    # Fallback to codec copy if transcoding produced no output
-    if [[ ! -s "$out" ]]; then
+    # Fallback to codec copy if transcoding produced no output. Skip when an
+    # early stop was requested — empty output there means a near-immediate stop,
+    # not a transcode failure, and a copy retry would just block on the dead RTSP.
+    if [[ ! -s "$out" && ! ( -n "$stopflag" && -f "$stopflag" ) ]]; then
         log_warn "Transcode failed for $out — retrying with codec copy"
         deadline=$(( $(date +%s) + dur + 60 ))
-        _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" \
+        _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" "$stopflag" \
             ffmpeg \
             -rtsp_transport tcp \
             -i "$rtsp" \
@@ -532,12 +630,16 @@ _run_recording() {
         | tr '[:upper:]' '[:lower:]' | tr ' /' '--' | tr -cd 'a-z0-9_-')
     local site_safe; site_safe=$(echo "$site_name" \
         | tr '[:upper:]' '[:lower:]' | tr ' /' '--' | tr -cd 'a-z0-9_-')
-    local rec_date; rec_date=$(date '+%Y-%m-%d')
-    local rec_ts; rec_ts=$(date '+%H%M%S')
+    local rec_stamp; rec_stamp=$(date '+%Y%m%d-%H%M%S')
     local start_time; start_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     local rec_file="${TMP_DIR}/rec_${rec_id}.mp4"
-    local blob_path="${site_safe}/${rec_date}/${cam_safe}-${rec_ts}.mp4"
-    local thumb_path="${site_safe}/${rec_date}/${cam_safe}-${rec_ts}_thumb.jpg"
+    # Blob layout: <prefix>/<site_uuid>/<camera>-<timestamp>.{mp4,jpg} inside the
+    # $AZURE_CONTAINER container. Falls back to the sanitized site name if the
+    # uuid couldn't be resolved from token-context.
+    local site_seg="${CLIENT_SITE_UUID:-${site_safe:-unknown-site}}"
+    local blob_path="${AZURE_BLOB_PREFIX}/${site_seg}/${cam_safe}-${rec_stamp}.mp4"
+    local thumb_path="${AZURE_BLOB_PREFIX}/${site_seg}/${cam_safe}-${rec_stamp}_thumb.jpg"
+    local stopflag="${ACTIVE_DIR}/${rec_id}.stop"
 
     log "Recording $rec_id: starting (cam=$cam_name, site=$site_name, ${dur_sec}s)"
 
@@ -546,14 +648,21 @@ _run_recording() {
 
     while (( attempt < max_attempts && remaining > min_dur )); do
         attempt=$(( attempt + 1 ))
-        _ffmpeg_record "$rtsp" "$rec_file" "$remaining"
+        _ffmpeg_record "$rtsp" "$rec_file" "$remaining" "$stopflag"
+
+        # An explicit early-stop ends the recording now — keep whatever was
+        # captured and skip the short-recording retry logic below.
+        if [[ -f "$stopflag" ]]; then
+            log "Recording $rec_id: stopped on command — finalizing"
+            break
+        fi
 
         if [[ ! -s "$rec_file" ]]; then
             local ffmpeg_err
             ffmpeg_err=$(grep -v "^$" "${rec_file}.err" 2>/dev/null | tail -5 | tr '\n' ' ')
             log_error "Recording $rec_id: ffmpeg failed for camera '$cam_name' (${rtsp%%@*}) — ${ffmpeg_err:-no output}"
             _api_update "$rec_id" "" "failed" "$start_time" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$dur_sec" "$cam_id"
-            rm -f "$rec_file" "${rec_file}.err" "${ACTIVE_DIR}/${rec_id}"
+            rm -f "$rec_file" "${rec_file}.err"; rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
             return
         fi
 
@@ -573,7 +682,28 @@ _run_recording() {
     done
 
     local sz; sz=$(_file_size "$rec_file")
+
+    # An early stop before any frames were captured leaves an empty file —
+    # nothing to upload. Report failed and bail (the normal full-duration path
+    # already handles empty output inside the retry loop above).
+    if [[ ! -s "$rec_file" ]]; then
+        log_warn "Recording $rec_id: stopped with no captured video — nothing to upload"
+        _api_update "$rec_id" "" "failed" "$start_time" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "0" "$cam_id"
+        rm -f "$rec_file" "${rec_file}.err"; rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
+        return
+    fi
+
     log "Recording $rec_id: ffmpeg done (${sz}B), uploading..."
+
+    # Report the actual captured length when stopped early; otherwise the
+    # requested duration (matches prior behaviour for full-length recordings).
+    local report_dur="$dur_sec"
+    if [[ -f "$stopflag" ]]; then
+        local probe_dur
+        probe_dur=$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$rec_file" 2>/dev/null | cut -d. -f1)
+        report_dur=${probe_dur:-0}
+    fi
 
     local url; url=$(_azure_upload "$rec_file" "$blob_path") || url=""
     local thumb; thumb=$(_upload_thumb "$rec_file" "$thumb_path") || thumb=""
@@ -582,17 +712,39 @@ _run_recording() {
     local stop_time; stop_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
     if [[ -n "$url" ]]; then
-        _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$dur_sec" "$cam_id"
+        _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$report_dur" "$cam_id"
         log "Recording $rec_id: completed — $blob_path (${sz}B)"
     else
-        _api_update "$rec_id" "" "failed" "$start_time" "$stop_time" "$dur_sec" "$cam_id"
+        _api_update "$rec_id" "" "failed" "$start_time" "$stop_time" "$report_dur" "$cam_id"
         log_error "Recording $rec_id: upload failed"
     fi
 
-    rm -f "${ACTIVE_DIR}/${rec_id}"
+    rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
 }
 
-# ---- Dispatch a list of recording objects ------------------------------
+# ---- Dispatch a single recording; atomic claim avoids double-start -----
+# Used by both the poll loop and the Firebase consumer (which run concurrently).
+# `mkdir` is the claim: it succeeds for exactly one caller per recording_id.
+# Returns 0 if dispatched, 1 if skipped (invalid or already active).
+_dispatch_one() {
+    local rec_id="$1" cam_id="$2" cam_name="$3" dur_sec="$4" rtsp="$5" site_name="${6:-}"
+
+    if [[ -z "$rec_id" || -z "$rtsp" ]]; then
+        log_warn "Skipping invalid recording (missing recording_id or camera_url): id='$rec_id'"
+        return 1
+    fi
+
+    if ! mkdir "${ACTIVE_DIR}/${rec_id}" 2>/dev/null; then
+        log_debug "Recording $rec_id: already active — skip"
+        return 1
+    fi
+
+    log "Recording $rec_id: dispatching (cam=$cam_name, site=$site_name, ${dur_sec}s)"
+    _run_recording "$rec_id" "$cam_id" "$cam_name" "$dur_sec" "$rtsp" "$site_name" &
+    return 0
+}
+
+# ---- Dispatch a list of recording objects (poll path) ------------------
 _dispatch() {
     local json="$1"
     local n; n=$(echo "$json" | jq 'length' 2>/dev/null); n=${n:-0}
@@ -608,22 +760,225 @@ _dispatch() {
         rtsp=$(echo "$rec"      | jq -r '.camera_url         // empty')
         dur_sec=$(echo "$rec"   | jq -r '.recording_duration // 3600')
 
-        if [[ -z "$rec_id" || -z "$rtsp" ]]; then
-            log_warn "Skipping invalid entry (missing recording_id or camera_url): $rec"
-            continue
-        fi
-
-        if [[ -f "${ACTIVE_DIR}/${rec_id}" ]]; then
-            log_debug "Recording $rec_id: already active — skip"; continue
-        fi
-
-        touch "${ACTIVE_DIR}/${rec_id}"
-        log "Recording $rec_id: dispatching (cam=$cam_name, site=$site_name, ${dur_sec}s)"
-        _run_recording "$rec_id" "$cam_id" "$cam_name" "$dur_sec" "$rtsp" "$site_name" &
-        dispatched=$(( dispatched + 1 ))
+        _dispatch_one "$rec_id" "$cam_id" "$cam_name" "$dur_sec" "$rtsp" "$site_name" \
+            && dispatched=$(( dispatched + 1 ))
     done
 
     [[ $dispatched -eq 0 && $n -gt 0 ]] && sleep 5 || true
+}
+
+# ---- Conservative polling-based stop detection (fallback only) ---------
+# When Firebase push is unavailable, a recording that disappears from the
+# server's active list is taken as a stop. Two-poll hysteresis + a startup
+# grace period guard against the brief window where a just-claimed recording
+# isn't yet reported active (the in_progress claim clears the camera flag).
+# $1 = newline-separated recording_ids the server currently reports active.
+_poll_stop_check() {
+    [[ "$FIREBASE_ENABLED" == "1" ]] && return 0   # push path owns stop
+    local active_ids="$1"
+    local now; now=$(date +%s)
+    local missdir="${TMP_DIR}/pollmiss"; mkdir -p "$missdir"
+    local d rid started misses
+    for d in "${ACTIVE_DIR}"/*/; do
+        [[ -d "$d" ]] || continue
+        rid=$(basename "$d")
+        if printf '%s\n' "$active_ids" | grep -qxF "$rid"; then
+            rm -f "${missdir}/${rid}"; continue
+        fi
+        started=$(stat -c %Y "$d" 2>/dev/null || echo "$now")
+        (( now - started < 60 )) && continue   # too new — don't race the claim
+        misses=$(cat "${missdir}/${rid}" 2>/dev/null || echo 0)
+        misses=$(( misses + 1 ))
+        echo "$misses" > "${missdir}/${rid}"
+        if (( misses >= 2 )); then
+            log "Recording $rid: absent from server for 2 polls — stopping early"
+            touch "${ACTIVE_DIR}/${rid}.stop"
+            rm -f "${missdir}/${rid}"
+        fi
+    done
+}
+
+# ---- Firebase listener: write the embedded Python helper to disk -------
+# Kept inline (like the Azure upload snippets) so the daemon stays a single
+# installable file. Reads service-account creds + DB URL from the environment
+# and streams recording start/stop commands as one JSON object per stdout line.
+_write_listener_script() {
+    cat > "$LISTENER_SCRIPT" <<'PYEOF'
+#!/usr/bin/env python3
+"""Stream VisionAI recording start/stop commands from Firebase RTDB.
+
+Connects to recording-commands/{site_uuid}/{recording_id} and prints each command
+as a single compact JSON line to stdout. The initial snapshot (commands still
+in-flight — the backend deletes each one when its recording completes) is recorded
+but NOT emitted, so a listener reconnect never re-triggers an in-progress or stale
+command; anything genuinely active is recovered by polling. Exits non-zero on
+fatal error so the bash supervisor restarts it.
+"""
+import json
+import os
+import sys
+import time
+
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db
+except Exception as e:  # pragma: no cover
+    print(f"firebase_admin import failed: {e}", file=sys.stderr)
+    sys.exit(2)
+
+DB_URL = os.environ.get("FIREBASE_DATABASE_URL")
+if not DB_URL:
+    print("FIREBASE_DATABASE_URL not set", file=sys.stderr)
+    sys.exit(2)
+
+
+def _load_credentials():
+    sa_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+    if sa_path and os.path.isfile(sa_path):
+        return credentials.Certificate(sa_path)
+    sa = {
+        "type": "service_account",
+        "project_id": os.environ.get("FIREBASE_PROJECT_ID"),
+        "private_key_id": os.environ.get("FIREBASE_PRIVATE_KEY_ID"),
+        "private_key": (os.environ.get("FIREBASE_PRIVATE_KEY") or "").replace("\\n", "\n"),
+        "client_email": os.environ.get("FIREBASE_CLIENT_EMAIL"),
+        "client_id": os.environ.get("FIREBASE_CLIENT_ID"),
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": os.environ.get("FIREBASE_CLIENT_X509_CERT_URL"),
+    }
+    if not (sa["project_id"] and sa["private_key"] and sa["client_email"]):
+        print("Firebase service account env vars incomplete", file=sys.stderr)
+        sys.exit(2)
+    return credentials.Certificate(sa)
+
+
+def _collect(data):
+    """Yield dicts that look like recording commands (have an 'action')."""
+    if isinstance(data, dict):
+        if "action" in data and "recording_id" in data:
+            yield data
+        else:
+            for v in data.values():
+                yield from _collect(v)
+    elif isinstance(data, list):
+        # RTDB returns a list when keys are sequential integers.
+        for v in data:
+            if v is not None:
+                yield from _collect(v)
+
+
+_seen = {}      # recording_id -> last seen timestamp
+_primed = {"v": False}
+
+
+def _emit(c):
+    out = {
+        "action": c.get("action"),
+        "recording_id": c.get("recording_id"),
+        "camera_id": c.get("camera_id"),
+        "camera_name": c.get("camera_name"),
+        "camera_url": c.get("camera_url"),
+        "recording_type": c.get("recording_type"),
+        "duration_seconds": c.get("duration_seconds"),
+        "site_id": c.get("site_id"),
+    }
+    print(json.dumps(out), flush=True)
+
+
+def _handle(event):
+    try:
+        for c in _collect(event.data):
+            rid = str(c.get("recording_id"))
+            ts = c.get("timestamp", "")
+            if _seen.get(rid) == ts:
+                continue                 # already processed this exact command
+            _seen[rid] = ts
+            if _primed["v"]:
+                _emit(c)                 # live change — act on it
+            # else: part of the initial snapshot — record only
+    except Exception as e:
+        print(f"handler error: {e}", file=sys.stderr)
+    finally:
+        # The first delivered event is the initial snapshot; everything after
+        # it is a live change.
+        _primed["v"] = True
+
+
+def main():
+    try:
+        cred = _load_credentials()
+        firebase_admin.initialize_app(cred, {"databaseURL": DB_URL})
+        # Scope to this client's site path when known, so we never see other
+        # sites' commands; fall back to the whole tree if it's unknown.
+        ref_path = os.environ.get("FIREBASE_PATH") or "recording-commands"
+        db.reference(ref_path).listen(_handle)
+        print(f"listener connected ({ref_path})", file=sys.stderr)
+    except Exception as e:
+        print(f"listener init failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    # listen() streams on a background thread; block the main thread.
+    while True:
+        time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()
+PYEOF
+}
+
+# ---- Firebase consumer + supervisor (runs as a background subprocess) --
+# Reads one JSON command per line from the listener and feeds the shared
+# dispatch / stop path. Restarts the listener with a backoff if it exits.
+_firebase_loop() {
+    trap - EXIT INT TERM   # don't inherit the daemon's PID-file cleanup
+    while true; do
+        log "Firebase listener: starting"
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local action rec_id cam_id cam_name rtsp rtype dur
+            action=$(echo "$line" | jq -r '.action       // empty' 2>/dev/null)
+            rec_id=$(echo "$line" | jq -r '.recording_id // empty' 2>/dev/null)
+            [[ -z "$rec_id" ]] && continue
+            case "$action" in
+                start)
+                    rtype=$(echo "$line" | jq -r '.recording_type // "inference"' 2>/dev/null)
+                    if [[ "$rtype" != "raw" ]]; then
+                        log_debug "Firebase: start $rec_id type=$rtype — not raw, skip"; continue
+                    fi
+                    local cmd_site; cmd_site=$(echo "$line" | jq -r '.site_id // empty' 2>/dev/null)
+                    # Belt-and-suspenders: even though the listener is scoped to
+                    # our site path, drop any command for a different site.
+                    if [[ -n "$CLIENT_SITE_ID" && -n "$cmd_site" && "$cmd_site" != "$CLIENT_SITE_ID" ]]; then
+                        log_debug "Firebase: start $rec_id for site $cmd_site != ours ($CLIENT_SITE_ID) — skip"; continue
+                    fi
+                    cam_id=$(echo "$line"   | jq -r '.camera_id        // empty' 2>/dev/null)
+                    cam_name=$(echo "$line" | jq -r '.camera_name      // .camera_id // empty' 2>/dev/null)
+                    rtsp=$(echo "$line"     | jq -r '.camera_url       // empty' 2>/dev/null)
+                    dur=$(echo "$line"      | jq -r '.duration_seconds // 3600' 2>/dev/null)
+                    # Prefer the resolved site name; else a stable site-<id> folder.
+                    local site_label="$CLIENT_SITE_NAME"
+                    [[ -z "$site_label" && -n "$cmd_site" ]] && site_label="site-${cmd_site}"
+                    log "Firebase: start command for recording $rec_id (cam=$cam_name, site=${site_label:-unknown}, ${dur}s)"
+                    _dispatch_one "$rec_id" "$cam_id" "$cam_name" "$dur" "$rtsp" "$site_label" || true
+                    ;;
+                stop)
+                    if [[ -d "${ACTIVE_DIR}/${rec_id}" ]]; then
+                        log "Firebase: stop command for recording $rec_id — finalizing"
+                        touch "${ACTIVE_DIR}/${rec_id}.stop"
+                    else
+                        log_debug "Firebase: stop for $rec_id but not active locally — ignoring"
+                    fi
+                    ;;
+                *)
+                    log_debug "Firebase: unknown action '$action' for $rec_id"
+                    ;;
+            esac
+        done < <("$FIREBASE_PYTHON" "$LISTENER_SCRIPT" 2>>"$LOG_FILE")
+        log_warn "Firebase listener exited — restarting in ${FIREBASE_RESTART_DELAY}s"
+        sleep "$FIREBASE_RESTART_DELAY"
+    done
 }
 
 # ---- Normalise GET response, then dispatch ----------------------------
@@ -648,6 +1003,7 @@ _poll() {
         local msg; msg=$(echo "$resp" | jq -r '.message // ""' 2>/dev/null)
         if echo "$msg" | grep -qi "no active recording"; then
             log "No pending recordings"
+            _poll_stop_check ""   # nothing active server-side → stop any locals
             return
         fi
         log_error "API error (HTTP 404): ${resp:0:200} — retry in ${POLL_INTERVAL}s"
@@ -674,14 +1030,32 @@ _poll() {
     fi
 
     local n; n=$(echo "$recs" | jq 'length' 2>/dev/null); n=${n:-0}
+    local active_ids; active_ids=$(echo "$recs" | jq -r '.[].recording_id // empty' 2>/dev/null)
+    _poll_stop_check "$active_ids"
     [[ "$n" -eq 0 ]] && { log "No pending recordings"; return; }
     log "Found $n pending recording(s)"
     _dispatch "$recs"
 }
 
 # ---- Main loop ---------------------------------------------------------
-_ensure_raw_recordings_folder
-log "Azure container ready (raw-recordings/ folder ensured)"
+_ensure_container
+log "Azure container ready (${AZURE_CONTAINER}/${AZURE_BLOB_PREFIX}/ ensured)"
+
+# Resolve the site this token is scoped to (for Firebase scoping + labelling).
+_fetch_site_context
+
+# Start the Firebase push listener (near-instant start/stop). Polling below
+# continues regardless and is the sole mechanism when Firebase is disabled.
+FIREBASE_LOOP_PID=""
+if [[ "$FIREBASE_ENABLED" == "1" ]]; then
+    export FIREBASE_PATH="$CLIENT_FIREBASE_PATH"   # scope listener to our site path
+    _write_listener_script
+    _firebase_loop &
+    FIREBASE_LOOP_PID=$!
+    log "Firebase listener active (loop PID=$FIREBASE_LOOP_PID, path=${CLIENT_FIREBASE_PATH:-<root>})"
+else
+    log "Firebase listener not started — polling only"
+fi
 
 _poll  # immediate check on startup
 

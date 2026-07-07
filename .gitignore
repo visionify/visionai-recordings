@@ -1,0 +1,13 @@
+# Environment / secrets — never commit these
+.env
+*.env
+.env.*
+.visionai/
+
+# Local notes / scratch
+redeploy_macos.txt
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~

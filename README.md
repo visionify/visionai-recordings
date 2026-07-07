@@ -160,8 +160,11 @@ ffmpeg -rtsp_transport tcp -i "rtsp://camera-ip/stream" -t 10 /tmp/test.mp4
 | `jq` | JSON parsing |
 | `curl` | API calls |
 | Python 3 + azure-storage-blob | Azure Blob upload (venv auto-created at `/opt/visionai/.venv`) |
+| Python 3 + firebase-admin | Optional — Firebase push listener for near-instant start/stop |
 
 The installer handles all of the above via `apt-get` and a Python venv.
+(`firebase-admin` is best-effort: if it can't install, the daemon runs in
+polling-only mode.)
 
 Required `.env` variables:
 
@@ -189,11 +192,11 @@ curl -fsSL https://raw.githubusercontent.com/visionify/visionai-recordings/main/
 
 The installer will:
 - Run `apt-get` to install `jq`, `ffmpeg`, `curl`, `python3`, `python3-venv` if missing
-- Create a Python venv at `/opt/visionai/.venv` and install `azure-storage-blob`
+- Create a Python venv at `/opt/visionai/.venv` and install `azure-storage-blob` (and, best-effort, `firebase-admin`)
 - Copy your `.env` to `~/.visionai/.env`
 - Install the script to `/usr/local/bin/visionai-recording-manager`
 - Register and start a systemd service (`visionai-recording-manager`) that runs at boot
-- Create the `raw-recordings` Azure Blob container if it doesn't exist
+- Create the `recordings` Azure Blob container if it doesn't exist
 
 ### Update
 
@@ -232,21 +235,27 @@ sudo systemctl stop visionai-recording-manager
 
 ### Azure Blob File Structure
 
-Each recording is a single file (no segments):
+Each recording is a single file (no segments), stored in the **`recordings`**
+container under a `raw-recordings/<site_uuid>/` prefix:
 
 ```
-raw-recordings/
-  <site-name>/
-    <YYYY-MM-DD>/
-      <camera>-<HHMMSS>.mp4
-      <camera>-<HHMMSS>_thumb.jpg
+recordings/                       ← container
+  raw-recordings/
+    <site_uuid>/
+      <camera>-<YYYYMMDD-HHMMSS>.mp4
+      <camera>-<YYYYMMDD-HHMMSS>_thumb.jpg
 ```
 
 Example:
 ```
-raw-recordings/downtown/2026-05-12/office-143000.mp4
-raw-recordings/downtown/2026-05-12/office-143000_thumb.jpg
+recordings/raw-recordings/3f9a…-uuid/office-20260512-143000.mp4
+recordings/raw-recordings/3f9a…-uuid/office-20260512-143000_thumb.jpg
 ```
+
+The container and prefix are overridable via `AZURE_CONTAINER` (default
+`recordings`) and `AZURE_BLOB_PREFIX` (default `raw-recordings`). `site_uuid`
+comes from `/v2/token-context`; if it can't be resolved, the sanitized site name
+is used instead.
 
 ### Video Settings
 
@@ -272,6 +281,37 @@ Expected file size: **150–400 MB** per 30-minute recording.
 | `UPLOAD_RETRY_DELAY` | `10` | Seconds between upload retries |
 | `PYTHON_BIN` | auto-detected | Path to Python 3 with azure-storage-blob |
 | `DEBUG` | `0` | Set to `1` for verbose logging |
+| `FIREBASE_DATABASE_URL` | _unset_ | Realtime DB URL — **set this to enable Firebase push** |
+| `FIREBASE_SERVICE_ACCOUNT` | _unset_ | Path to a service-account JSON (alternative to the fields below) |
+| `FIREBASE_PROJECT_ID` … | _unset_ | Service-account fields (same as the backend): `FIREBASE_PRIVATE_KEY_ID`, `FIREBASE_PRIVATE_KEY`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_CLIENT_ID`, `FIREBASE_CLIENT_X509_CERT_URL` |
+| `FIREBASE_RESTART_DELAY` | `15` | Seconds before restarting the listener if it exits |
+
+### Firebase push (optional — near-instant start/stop)
+
+By default the daemon **polls** `get-recording-status` every `POLL_INTERVAL` seconds,
+so a newly started or scheduled recording is picked up at the next poll (≤ 5 min by
+default), and recordings always run their full duration.
+
+Setting `FIREBASE_DATABASE_URL` plus service-account credentials enables a listener
+on the backend's Realtime DB path `recording-commands/{site_uuid}/{recording_id}`:
+
+- **Start** commands begin recording within seconds instead of waiting for a poll.
+- **Stop** commands end an in-progress recording early; whatever was captured is
+  uploaded and reported.
+
+The listener subscribes only to your site's `{site_uuid}` subtree — no cross-client
+collisions in a shared Firebase project. The client resolves everything from
+`GET /v2/token-context` at startup (using the API token): `site_uuid` (listener
+scope), `site_name` (folder label) and `site_id` (a safety filter) — no manual
+config needed. The `.env` vars `VISIONAI_SITE_UUID` / `VISIONAI_FIREBASE_PATH` /
+`VISIONAI_SITE_NAME` override the API values if you ever need to. If no `site_uuid`
+is resolved, the listener falls back to the unscoped root path and filters by `site_id`.
+
+Polling always stays on as a fallback. When Firebase is **disabled**, early-stop is
+still best-effort: a recording that disappears from the server's active list for two
+consecutive polls is stopped. Set the same `FIREBASE_*` values your backend uses
+(`src/api/firebase.js`). If the credentials or `firebase-admin` are missing, the
+daemon logs `Firebase disabled` and runs polling-only.
 
 ### Troubleshooting (Linux)
 
@@ -297,7 +337,7 @@ import sys
 from azure.storage.blob import BlobServiceClient
 conn_str = sys.argv[1]
 client = BlobServiceClient.from_connection_string(conn_str)
-blob = client.get_blob_client(container="raw-recordings", blob="test/upload-test.txt")
+blob = client.get_blob_client(container="recordings", blob="test/upload-test.txt")
 blob.upload_blob(b"test", overwrite=True)
 print("OK:", blob.url)
 EOF
