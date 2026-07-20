@@ -7,7 +7,10 @@
 #
 # Required env vars (via ENV_FILE or shell environment):
 #   VISIONAI_API_ENDPOINT  VISIONAI_API_TOKEN
-#   AWS_ACCESS_KEY_ID  AWS_SECRET_ACCESS_KEY  AWS_REGION  AWS_BUCKET_NAME
+#
+#   STORAGE_BACKEND selects the upload target (default: aws):
+#     aws   - AWS_ACCESS_KEY_ID  AWS_SECRET_ACCESS_KEY  AWS_REGION  AWS_BUCKET_NAME
+#     azure - AZURE_STORAGE_CONNECTION_STRING  AZURE_STORAGE_CONTAINER
 # Optional:
 #   SERVER_ID          - filter recordings to this server only
 #   POLL_INTERVAL      - seconds between polls (default: 300)
@@ -17,6 +20,10 @@
 #   DEBUG              - set to 1 for verbose logging
 #   ENV_FILE           - path to .env file (default: ~/.visionai/.env)
 #   LOG_FILE           - path to log file (default: /var/log/visionai/recording-manager.log)
+# Azure-only optional:
+#   AZURE_CDN_BASE_URL         - serve SAS URLs from this CDN/Front Door host instead of *.blob.core.windows.net
+#   AZURE_CDN_INCLUDE_CONTAINER- set to 1 if the CDN path includes the container name
+#   AZURE_SAS_EXPIRY_DAYS      - SAS token validity in days (default: 7)
 
 set -uo pipefail
 
@@ -26,6 +33,9 @@ UPLOAD_RETRIES=${UPLOAD_RETRIES:-3}
 UPLOAD_RETRY_DELAY=${UPLOAD_RETRY_DELAY:-10}
 ENV_FILE=${ENV_FILE:-${HOME}/.visionai/.env}
 LOG_FILE=${LOG_FILE:-/var/log/visionai/recording-manager.log}
+STORAGE_BACKEND=${STORAGE_BACKEND:-aws}
+AZURE_SAS_EXPIRY_DAYS=${AZURE_SAS_EXPIRY_DAYS:-7}
+AZURE_CDN_INCLUDE_CONTAINER=${AZURE_CDN_INCLUDE_CONTAINER:-0}
 TMP_DIR=/tmp/visionai-rec
 ACTIVE_DIR=$TMP_DIR/active
 PID_FILE=/var/run/visionai-recording-manager.pid
@@ -49,10 +59,22 @@ log_debug() { [[ "${DEBUG:-0}" == "1" ]] && echo "[$(_ts)] [rec-mgr] DEBUG: $*" 
 [[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; log "Loaded $ENV_FILE"; } \
     || log_warn "Env file not found at $ENV_FILE — using existing environment"
 
+# Normalise backend selection (env file may have overridden the default above)
+STORAGE_BACKEND=$(echo "${STORAGE_BACKEND:-aws}" | tr '[:upper:]' '[:lower:]')
+case "$STORAGE_BACKEND" in
+    aws|azure) ;;
+    *) log_error "Unknown STORAGE_BACKEND='$STORAGE_BACKEND' (expected aws or azure)"; exit 1 ;;
+esac
+
 _check_vars() {
+    local required=(VISIONAI_API_ENDPOINT VISIONAI_API_TOKEN)
+    if [[ "$STORAGE_BACKEND" == "azure" ]]; then
+        required+=(AZURE_STORAGE_CONNECTION_STRING AZURE_STORAGE_CONTAINER)
+    else
+        required+=(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_BUCKET_NAME)
+    fi
     local missing=()
-    for v in VISIONAI_API_ENDPOINT VISIONAI_API_TOKEN \
-              AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_BUCKET_NAME; do
+    for v in "${required[@]}"; do
         [[ -z "${!v:-}" ]] && missing+=("$v")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
@@ -60,6 +82,7 @@ _check_vars() {
     fi
 }
 _check_vars
+log "Storage backend: $STORAGE_BACKEND"
 
 for _cmd in jq ffmpeg curl; do
     command -v "$_cmd" >/dev/null 2>&1 || { log_error "$_cmd not found — install it first"; exit 1; }
@@ -78,11 +101,18 @@ else
     log_warn "h264_videotoolbox not available — using libx264 software encoder"
 fi
 
-# ---- Locate a Python 3 with boto3 -------------------------------------
+# ---- Locate a Python 3 with the SDK the selected backend needs --------
+if [[ "$STORAGE_BACKEND" == "azure" ]]; then
+    _PY_IMPORT="from azure.storage.blob import BlobServiceClient"
+    _PY_PKG="azure-storage-blob"
+else
+    _PY_IMPORT="import boto3"
+    _PY_PKG="boto3"
+fi
 _find_python() {
     # Prefer PYTHON_BIN if set in env
     if [[ -n "${PYTHON_BIN:-}" && -x "$PYTHON_BIN" ]]; then
-        "$PYTHON_BIN" -c "import boto3" 2>/dev/null && { echo "$PYTHON_BIN"; return; }
+        "$PYTHON_BIN" -c "$_PY_IMPORT" 2>/dev/null && { echo "$PYTHON_BIN"; return; }
     fi
     # Search common venv locations
     for _py in \
@@ -92,15 +122,15 @@ _find_python() {
         /opt/visionai/.venv/bin/python3 \
         python3 python; do
         [[ -x "$_py" ]] || command -v "$_py" >/dev/null 2>&1 || continue
-        "$_py" -c "import boto3" 2>/dev/null && { echo "$_py"; return; }
+        "$_py" -c "$_PY_IMPORT" 2>/dev/null && { echo "$_py"; return; }
     done
     echo ""
 }
 PYTHON_BIN=$(_find_python)
 if [[ -z "$PYTHON_BIN" ]]; then
-    log_error "No Python 3 with boto3 found — set PYTHON_BIN in $ENV_FILE"; exit 1
+    log_error "No Python 3 with $_PY_PKG found — install it (pip install $_PY_PKG) or set PYTHON_BIN in $ENV_FILE"; exit 1
 fi
-log "Using Python: $PYTHON_BIN (boto3 available)"
+log "Using Python: $PYTHON_BIN ($_PY_PKG available)"
 
 # ---- Singleton ---------------------------------------------------------
 if [[ -f "$PID_FILE" ]]; then
@@ -217,6 +247,87 @@ PYEOF
     echo ""
 }
 
+# ---- Upload file to Azure Blob Storage, return SAS URL or empty -------
+# Mirrors _s3_upload: same outer retry loop and the same single-flight
+# upload lock so concurrent recordings don't fight for the uplink. When
+# AZURE_CDN_BASE_URL is set the returned URL is served from that CDN /
+# Front Door host instead of *.blob.core.windows.net.
+_azure_upload() {
+    local file="$1" blob_name="$2"
+    local attempt=1
+    local stderr_file; stderr_file=$(mktemp)
+
+    while [[ $attempt -le $UPLOAD_RETRIES ]]; do
+        local result rc
+        result=$("$PYTHON_BIN" - "$file" "$AZURE_STORAGE_CONTAINER" "$blob_name" \
+                "$AZURE_STORAGE_CONNECTION_STRING" "${AZURE_CDN_BASE_URL:-}" \
+                "$AZURE_CDN_INCLUDE_CONTAINER" "$AZURE_SAS_EXPIRY_DAYS" \
+                2>"$stderr_file" <<'PYEOF'
+import sys, warnings, fcntl
+warnings.filterwarnings("ignore")
+from datetime import datetime, timedelta, timezone
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+
+(file_path, container, blob_name, conn_str,
+ cdn_base_url, cdn_include_container, sas_expiry_days) = sys.argv[1:]
+try:
+    # Serialize uploads across all concurrent recordings — same lock as
+    # the S3 path so multiple cameras hitting a segment boundary together
+    # don't saturate the uplink. Released automatically on process exit.
+    lock_fp = open("/tmp/visionai-rec/s3-upload.lock", "a+")
+    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+
+    client = BlobServiceClient.from_connection_string(conn_str)
+    blob_client = client.get_blob_client(container=container, blob=blob_name)
+    with open(file_path, "rb") as f:
+        blob_client.upload_blob(f, overwrite=True, max_concurrency=1)
+    sas_token = generate_blob_sas(
+        account_name=client.account_name,
+        container_name=container,
+        blob_name=blob_name,
+        account_key=client.credential.account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.now(timezone.utc) + timedelta(days=int(sas_expiry_days)),
+    )
+    if cdn_base_url:
+        host = cdn_base_url.split("://", 1)[-1].rstrip("/")
+        path = f"{container}/{blob_name}" if cdn_include_container == "1" else blob_name
+        url = f"https://{host}/{path}?{sas_token}"
+    else:
+        url = f"{blob_client.url}?{sas_token}"
+    print(url)
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+        )
+        rc=$?
+        if [[ $rc -eq 0 ]]; then
+            rm -f "$stderr_file"
+            echo "$result"
+            return
+        fi
+
+        local err; err=$(tr '\n' ' ' < "$stderr_file")
+        log_warn "Azure upload failed for $blob_name (attempt $attempt/$UPLOAD_RETRIES): ${err}" >&2
+        attempt=$(( attempt + 1 ))
+        [[ $attempt -le $UPLOAD_RETRIES ]] && sleep "$UPLOAD_RETRY_DELAY"
+    done
+
+    rm -f "$stderr_file"
+    log_error "Azure upload permanently failed for $blob_name after $UPLOAD_RETRIES attempts" >&2
+    echo ""
+}
+
+# ---- Backend-agnostic upload: dispatches to the configured backend ----
+_storage_upload() {
+    if [[ "$STORAGE_BACKEND" == "azure" ]]; then
+        _azure_upload "$@"
+    else
+        _s3_upload "$@"
+    fi
+}
+
 _file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
 
 # ---- Camera recording-enabled check -----------------------------------
@@ -313,7 +424,7 @@ _upload_thumb() {
     local tmp="${TMP_DIR}/$(basename "$seg" .mp4)_thumb.jpg"
     ffmpeg -i "$seg" -frames:v 1 -f image2 -y "$tmp" >/dev/null 2>&1 || true
     if [[ -s "$tmp" ]]; then
-        _s3_upload "$tmp" "$s3_key"
+        _storage_upload "$tmp" "$s3_key"
         rm -f "$tmp"
     else
         rm -f "$tmp"; echo ""
@@ -354,7 +465,7 @@ _run_recording() {
             local sz; sz=$(_file_size "$seg_file")
             local fname="${cam_safe}-${rec_ts}-${idx_fmt}"
             local thumb; thumb=$(_upload_thumb "$seg_file" "${base}/${fname}_thumb.jpg") || thumb=""
-            local url;   url=$(_s3_upload "$seg_file" "${base}/${fname}.mp4") || url=""
+            local url;   url=$(_storage_upload "$seg_file" "${base}/${fname}.mp4") || url=""
             if [[ -n "$url" ]]; then
                 rm -f "$seg_file"
             else

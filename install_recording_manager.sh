@@ -88,8 +88,9 @@ _require() {
 
 _require jq
 _require ffmpeg
-_require aws awscli
 _require curl
+# awscli is required only for the AWS backend — installed later, once the
+# env file is resolved and STORAGE_BACKEND is known.
 
 # ── Verify ffmpeg has VideoToolbox (hardware H.264 encoder) ──────────────────
 # VideoToolbox is built into macOS — the recording script uses
@@ -149,6 +150,65 @@ fi
 chmod 644 "$ENV_FILE"
 chown "$REAL_USER" "$ENV_FILE"
 ok "Env file: $ENV_FILE"
+
+# ── Python SDK for the selected storage backend ──────────────────────────────
+# The daemon uploads via Python (boto3 for AWS, azure-storage-blob for Azure)
+# using whatever venv recording_manager.sh's _find_python() locates. Make sure
+# the matching SDK is importable from that Python, installing it if missing.
+step "Checking Python storage SDK..."
+
+# Pull a value out of the resolved env file (strips surrounding quotes).
+_envval() {
+    local v; v=$(grep -E "^[[:space:]]*$1=" "$ENV_FILE" | tail -n1 | cut -d= -f2-)
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    echo "$v"
+}
+
+STORAGE_BACKEND=$(_envval STORAGE_BACKEND | tr '[:upper:]' '[:lower:]')
+STORAGE_BACKEND="${STORAGE_BACKEND:-aws}"
+ENV_PYTHON_BIN=$(_envval PYTHON_BIN)
+
+if [[ "$STORAGE_BACKEND" == "azure" ]]; then
+    SDK_PKG="azure-storage-blob"; SDK_IMPORT="from azure.storage.blob import BlobServiceClient"
+else
+    SDK_PKG="boto3"; SDK_IMPORT="import boto3"
+    _require aws awscli   # AWS backend only
+fi
+
+# Mirror recording_manager.sh's _find_python() search order to pick the Python
+# the daemon will actually use, preferring PYTHON_BIN from the env file.
+_pick_python() {
+    local _py
+    for _py in \
+        "$ENV_PYTHON_BIN" \
+        /Users/visionify/vision-pallet-management-inference/.venv/bin/python3 \
+        /Users/visionify/visionai/vision-pallet-management-inference/.venv/bin/python3 \
+        /Users/visionify/.venv/bin/python3 \
+        /opt/visionai/.venv/bin/python3 \
+        python3 python; do
+        [[ -z "$_py" ]] && continue
+        if [[ -x "$_py" ]]; then echo "$_py"; return; fi
+        command -v "$_py" >/dev/null 2>&1 && { command -v "$_py"; return; }
+    done
+    echo ""
+}
+TARGET_PY=$(_pick_python)
+
+if [[ -z "$TARGET_PY" ]]; then
+    warn "No Python 3 found — install one with $SDK_PKG, or set PYTHON_BIN in $ENV_FILE"
+elif sudo -u "$REAL_USER" "$TARGET_PY" -c "$SDK_IMPORT" >/dev/null 2>&1; then
+    ok "$SDK_PKG already available ($TARGET_PY)"
+else
+    warn "$SDK_PKG not importable from $TARGET_PY — installing..."
+    # Install as the venv's owner to avoid root-owned files; fall back to root.
+    sudo -u "$REAL_USER" "$TARGET_PY" -m pip install --quiet "$SDK_PKG" </dev/null 2>/dev/null \
+        || "$TARGET_PY" -m pip install --quiet "$SDK_PKG" </dev/null 2>/dev/null || true
+    if sudo -u "$REAL_USER" "$TARGET_PY" -c "$SDK_IMPORT" >/dev/null 2>&1; then
+        ok "$SDK_PKG installed ($TARGET_PY)"
+    else
+        warn "Could not install $SDK_PKG into $TARGET_PY — install it manually:\n      $TARGET_PY -m pip install $SDK_PKG"
+    fi
+fi
 
 # ── Download recording manager script ────────────────────────────────────────
 step "Downloading recording manager script..."
