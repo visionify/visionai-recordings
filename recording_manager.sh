@@ -55,9 +55,30 @@ log_warn()  { echo "[$(_ts)] [rec-mgr] WARN: $*" >&2; }
 log_error() { echo "[$(_ts)] [rec-mgr] ERROR: $*" >&2; }
 log_debug() { [[ "${DEBUG:-0}" == "1" ]] && echo "[$(_ts)] [rec-mgr] DEBUG: $*" >&2 || true; }
 
-# shellcheck disable=SC1090
-[[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; log "Loaded $ENV_FILE"; } \
-    || log_warn "Env file not found at $ENV_FILE — using existing environment"
+# Safer env loader — only exports lines matching KEY=VALUE, never *executes*
+# the value. Sourcing the file directly breaks on Azure connection strings
+# (full of ';' and '=') and any other value with shell metacharacters.
+_load_env() {
+    local file="$1" line _key _val
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%$'\r'}"                              # strip Windows \r
+        line="${line%"${line##*[! ]}"}"                    # strip trailing spaces
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue        # skip comments
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue        # skip blank lines
+        [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue  # skip invalid
+        _key="${line%%=*}"
+        _val="${line#*=}"
+        # Strip one layer of matching surrounding double or single quotes
+        if [[ "$_val" == \"*\" ]]; then _val="${_val#\"}"; _val="${_val%\"}"; fi
+        if [[ "$_val" == \'*\' ]]; then _val="${_val#\'}"; _val="${_val%\'}"; fi
+        export "${_key}=${_val}"
+    done < "$file"
+}
+if [[ -f "$ENV_FILE" ]]; then
+    _load_env "$ENV_FILE"; log "Loaded $ENV_FILE"
+else
+    log_warn "Env file not found at $ENV_FILE — using existing environment"
+fi
 
 # Normalise backend selection (env file may have overridden the default above)
 STORAGE_BACKEND=$(echo "${STORAGE_BACKEND:-aws}" | tr '[:upper:]' '[:lower:]')
@@ -114,13 +135,24 @@ _find_python() {
     if [[ -n "${PYTHON_BIN:-}" && -x "$PYTHON_BIN" ]]; then
         "$PYTHON_BIN" -c "$_PY_IMPORT" 2>/dev/null && { echo "$PYTHON_BIN"; return; }
     fi
-    # Search common venv locations
-    for _py in \
-        /Users/visionify/vision-pallet-management-inference/.venv/bin/python3 \
-        /Users/visionify/visionai/vision-pallet-management-inference/.venv/bin/python3 \
-        /Users/visionify/.venv/bin/python3 \
-        /opt/visionai/.venv/bin/python3 \
-        python3 python; do
+    # Build the search list. The daemon runs as root, so $HOME isn't the
+    # deploying user's — derive candidate homes from the ENV_FILE path and
+    # from every account under /Users so venvs are found regardless of which
+    # user (visionify, palletvision, …) owns them.
+    local _candidates=() _home _rel
+    for _home in "$(dirname "$(dirname "$ENV_FILE")")" /Users/*; do
+        [[ -d "$_home" ]] || continue
+        for _rel in \
+            vision-pallet-management-inference/.venv/bin/python3 \
+            visionai/vision-pallet-management-inference/.venv/bin/python3 \
+            .venv/bin/python3; do
+            _candidates+=("$_home/$_rel")
+        done
+    done
+    _candidates+=(/opt/visionai/.venv/bin/python3 python3 python)
+
+    local _py
+    for _py in "${_candidates[@]}"; do
         [[ -x "$_py" ]] || command -v "$_py" >/dev/null 2>&1 || continue
         "$_py" -c "$_PY_IMPORT" 2>/dev/null && { echo "$_py"; return; }
     done

@@ -177,19 +177,37 @@ fi
 
 # Mirror recording_manager.sh's _find_python() search order to pick the Python
 # the daemon will actually use, preferring PYTHON_BIN from the env file.
+# Candidate interpreters, in preference order. Derive venv paths from every
+# /Users account (and the deploying user's home) so we don't assume the
+# 'visionify' username — client boxes run as palletvision, etc.
+_python_candidates() {
+    [[ -n "$ENV_PYTHON_BIN" ]] && echo "$ENV_PYTHON_BIN"
+    local _home _rel
+    for _home in "$REAL_HOME" /Users/*; do
+        [[ -d "$_home" ]] || continue
+        for _rel in \
+            vision-pallet-management-inference/.venv/bin/python3 \
+            visionai/vision-pallet-management-inference/.venv/bin/python3 \
+            .venv/bin/python3; do
+            echo "$_home/$_rel"
+        done
+    done
+    echo /opt/visionai/.venv/bin/python3
+    command -v python3 2>/dev/null
+    command -v python  2>/dev/null
+}
+
 _pick_python() {
     local _py
-    for _py in \
-        "$ENV_PYTHON_BIN" \
-        /Users/visionify/vision-pallet-management-inference/.venv/bin/python3 \
-        /Users/visionify/visionai/vision-pallet-management-inference/.venv/bin/python3 \
-        /Users/visionify/.venv/bin/python3 \
-        /opt/visionai/.venv/bin/python3 \
-        python3 python; do
-        [[ -z "$_py" ]] && continue
-        if [[ -x "$_py" ]]; then echo "$_py"; return; fi
-        command -v "$_py" >/dev/null 2>&1 && { command -v "$_py"; return; }
-    done
+    # First pass: prefer an interpreter that ALREADY imports the SDK.
+    while IFS= read -r _py; do
+        [[ -x "$_py" ]] || continue
+        sudo -u "$REAL_USER" "$_py" -c "$SDK_IMPORT" >/dev/null 2>&1 && { echo "$_py"; return; }
+    done < <(_python_candidates)
+    # Second pass: first usable interpreter (we'll pip install the SDK into it).
+    while IFS= read -r _py; do
+        [[ -x "$_py" ]] && { echo "$_py"; return; }
+    done < <(_python_candidates)
     echo ""
 }
 TARGET_PY=$(_pick_python)
