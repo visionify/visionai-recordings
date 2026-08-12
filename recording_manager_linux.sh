@@ -543,19 +543,25 @@ _api_post() {
 }
 
 # POST /v2/update-recording-url — covers in_progress, completed, failed
+# $8 is the blob path ("<container>/<blob>"). The API stores it and mints a
+# short-lived playback URL from it on demand, so the long-lived SAS URL in
+# azure_url stops being the thing the archive depends on. azure_url is still
+# sent for older backends that have no blob_path column.
 _api_update() {
     local recording_id="$1" azure_url="$2" status="$3"
     local start_time="${4:-}" stop_time="${5:-}" duration="${6:-0}" camera_id="${7:-0}"
+    local blob_path="${8:-}"
     local body resp
     body=$(jq -n \
         --argjson rid "$recording_id" \
         --arg     url "$azure_url" \
+        --arg     bp  "$blob_path" \
         --arg     st  "$status" \
         --arg     start "$start_time" \
         --arg     stop  "$stop_time" \
         --argjson dur   "$duration" \
         --argjson cid   "$camera_id" \
-        '{recording_id:$rid,azure_url:$url,status:$st,
+        '{recording_id:$rid,azure_url:$url,blob_path:$bp,status:$st,
           start_time:$start,stop_time:$stop,duration:$dur,camera_id:$cid}')
     resp=$(_api_post "${VISIONAI_API_ENDPOINT}/v2/update-recording-url" "$body" 2>/dev/null) || true
     log_debug "Recording $recording_id: _api_update status=$status resp=${resp:0:120}"
@@ -778,7 +784,8 @@ _spool_drain() {
 
         thumb=""
         [[ -n "$thumb_path" ]] && { thumb=$(_upload_thumb "$f" "$thumb_path") || thumb=""; }
-        _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$duration" "$cam_id"
+        _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$duration" "$cam_id" \
+                    "${AZURE_CONTAINER}/${blob_path}"
         log "Recording $rec_id: completed from spool — $blob_path"
         rm -f "$f" "$meta"
     done
@@ -1188,7 +1195,8 @@ _run_recording() {
     local thumb; thumb=$(_upload_thumb "$rec_file" "$thumb_path") || thumb=""
     rm -f "$rec_file" "${rec_file}.err"
 
-    _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$report_dur" "$cam_id"
+    _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$report_dur" "$cam_id" \
+                "${AZURE_CONTAINER}/${blob_path}"
     log "Recording $rec_id: completed — $blob_path (${sz}B)"
 
     rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"; _duration_forget "$rec_id"
