@@ -355,6 +355,26 @@ The requested duration is read from the start payload in this order:
 | `recording_duration` | seconds | `get-recording-status` poll response |
 | `duration_minutes` | minutes (×60 applied) | macOS client's endpoint |
 
+**Stopgap: push duration wins over poll duration.** The backend has been seen
+quoting two different durations for one recording — recording 952 arrived as
+`duration_seconds: 600` on the Firebase push while `/v2/get-recording-status`
+returned `recording_duration: 900` for the same id. The poll value then wins on
+any re-dispatch (after a daemon restart, for instance) and the recording runs
+for a length nobody chose.
+
+The daemon now remembers what each Firebase start command quoted, under
+`$WORK_DIR/durations/<recording_id>` so it survives a restart, and prefers it
+when a poll later reports something different:
+
+```
+Recording 952: poll reports 900s but the Firebase start command said 600s — using 600s (backend duration mismatch)
+```
+
+That log line is the evidence for the backend fix. Recordings never announced
+over Firebase are unaffected and use the polled value. Set
+`PREFER_FIREBASE_DURATION=0` once the API agrees with itself — the mismatch is
+logged either way.
+
 If none of them is present or usable, the daemon logs a warning and falls back
 to `RECORDING_DEFAULT_SEC`. It also warns when a seconds field holds a value
 under a minute, which usually means the sender passed minutes without
@@ -411,6 +431,8 @@ ffmpeg deadline exceeded for ... — terminating     # encoder could not keep up
 | `SEGMENT_DURATION` | `600` | Capture window length; segments are joined into one file before upload |
 | `RECORDING_MAX_ATTEMPTS` | `3` | Consecutive short segments tolerated before giving up |
 | `RECORDING_DEFAULT_SEC` | `3600` | Fallback only, used when a start payload carries no recognizable duration field |
+| `PREFER_FIREBASE_DURATION` | `1` | Prefer the duration a Firebase start command quoted over a conflicting poll value |
+| `DURATION_MAX_AGE_HOURS` | `24` | Age after which a remembered push duration is pruned |
 | `FFMPEG_RW_TIMEOUT_US` | `15000000` | ffmpeg RTSP socket timeout (µs). Bounds a camera that accepts the connection then stops sending |
 | `FFMPEG_TERM_GRACE` | `10` | Seconds ffmpeg gets to finalize on SIGTERM before SIGKILL |
 | `WORK_DIR` | `/var/lib/visionai/rec` | Captures and upload spool. Deliberately not under `/tmp` |

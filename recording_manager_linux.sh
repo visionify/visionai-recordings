@@ -309,6 +309,9 @@ fi
 TMP_DIR=$WORK_DIR
 ACTIVE_DIR=$TMP_DIR/active
 SPOOL_DIR=${SPOOL_DIR:-$TMP_DIR/spool}
+# Durations quoted by Firebase start commands, kept per recording id so they
+# survive a daemon restart. See PREFER_FIREBASE_DURATION below.
+DURATION_DIR=$TMP_DIR/durations
 PID_FILE=/var/run/visionai-recording-manager.pid
 LISTENER_SCRIPT=$TMP_DIR/firebase_listener.py
 # Spool ceilings — a permanently broken uplink must not fill the disk.
@@ -330,6 +333,16 @@ RECORDING_MAX_ATTEMPTS=${RECORDING_MAX_ATTEMPTS:-3}
 SEGMENT_DURATION=${SEGMENT_DURATION:-600}
 # Used only when a start payload carries no recognizable duration field.
 RECORDING_DEFAULT_SEC=${RECORDING_DEFAULT_SEC:-3600}
+# STOPGAP for a backend that quotes two different durations for one recording:
+# the Firebase start command carries the duration the operator actually chose,
+# while /v2/get-recording-status has been seen returning a different value for
+# the same recording_id (952: 600s by push, 900s by poll). The poll value then
+# wins on any re-dispatch — after a daemon restart, say — and the recording runs
+# for a length nobody asked for. Remember what the push said and prefer it.
+# Set to 0 once the API agrees with itself; the mismatch is logged either way.
+PREFER_FIREBASE_DURATION=${PREFER_FIREBASE_DURATION:-1}
+# Remembered durations older than this are pruned; well past any recording.
+DURATION_MAX_AGE_HOURS=${DURATION_MAX_AGE_HOURS:-24}
 # RTSP socket I/O timeout. Without it a stalled read is invisible until the
 # capture's deadline, so the recording just ends short; with it ffmpeg fails
 # fast and the attempt loop resumes for the part that is missing.
@@ -345,7 +358,7 @@ CLIENT_SITE_NAME=""
 CLIENT_SITE_UUID=""
 CLIENT_FIREBASE_PATH=""   # recording-commands/{site_uuid} — listener scope
 
-mkdir -p "$(dirname "$LOG_FILE")" "$TMP_DIR" "$ACTIVE_DIR" "$SPOOL_DIR"
+mkdir -p "$(dirname "$LOG_FILE")" "$TMP_DIR" "$ACTIVE_DIR" "$SPOOL_DIR" "$DURATION_DIR"
 exec >> "$LOG_FILE" 2>&1
 
 _ts()       { date '+%Y-%m-%d %H:%M:%S'; }
@@ -1110,7 +1123,7 @@ _run_recording() {
     if (( ${#parts[@]} == 0 )); then
         log_error "Recording $rec_id: no video captured for camera '$cam_name' (${rtsp%%@*}) — ${last_err:-no output}"
         _api_update "$rec_id" "" "failed" "$start_time" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "0" "$cam_id"
-        rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
+        rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"; _duration_forget "$rec_id"
         return
     fi
 
@@ -1138,7 +1151,7 @@ _run_recording() {
     if [[ ! -s "$rec_file" ]]; then
         log_warn "Recording $rec_id: stopped with no captured video — nothing to upload"
         _api_update "$rec_id" "" "failed" "$start_time" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "0" "$cam_id"
-        rm -f "$rec_file" "${rec_file}.err"; rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
+        rm -f "$rec_file" "${rec_file}.err"; rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"; _duration_forget "$rec_id"
         return
     fi
 
@@ -1163,12 +1176,12 @@ _run_recording() {
         rm -f "${rec_file}.err"
         if _spool_put "$rec_file" "$rec_id" "$cam_id" "$blob_path" "$thumb_path" \
                       "$start_time" "$stop_time" "$report_dur"; then
-            rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
+            rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"; _duration_forget "$rec_id"
             return
         fi
         log_error "Recording $rec_id: upload failed and could not be spooled — recording lost"
         _api_update "$rec_id" "" "failed" "$start_time" "$stop_time" "$report_dur" "$cam_id"
-        rm -f "$rec_file"; rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
+        rm -f "$rec_file"; rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"; _duration_forget "$rec_id"
         return
     fi
 
@@ -1178,7 +1191,7 @@ _run_recording() {
     _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$report_dur" "$cam_id"
     log "Recording $rec_id: completed — $blob_path (${sz}B)"
 
-    rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
+    rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"; _duration_forget "$rec_id"
 }
 
 # ---- Resolve a start payload's duration, in seconds --------------------
@@ -1211,6 +1224,49 @@ _duration_sec() {
 
     log_warn "Recording $rec_id: no usable duration field in payload (looked for duration_seconds, recording_duration, duration_minutes) — defaulting to ${RECORDING_DEFAULT_SEC}s"
     echo "$RECORDING_DEFAULT_SEC"
+}
+
+# ---- Remember the duration a Firebase start command quoted --------------
+# Kept on the state dir rather than in memory so it survives the restart that
+# is exactly when the poll path would otherwise override it.
+_duration_remember() {
+    local rec_id="$1" dur="$2"
+    [[ "$PREFER_FIREBASE_DURATION" == "1" ]] || return 0
+    [[ "$rec_id" =~ ^[A-Za-z0-9_-]+$ && "$dur" =~ ^[0-9]+$ ]] || return 0
+    mkdir -p "$DURATION_DIR" 2>/dev/null || return 0
+    echo "$dur" > "${DURATION_DIR}/${rec_id}" 2>/dev/null || true
+}
+
+_duration_forget() {
+    local rec_id="$1"
+    [[ "$rec_id" =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+    rm -f "${DURATION_DIR}/${rec_id}" 2>/dev/null || true
+}
+
+# Prefer a remembered push duration over the one a poll just reported, and say
+# so when they differ — that log line is the evidence the backend needs.
+_duration_preferred() {
+    local rec_id="$1" polled="$2" remembered
+    [[ "$PREFER_FIREBASE_DURATION" == "1" ]] || { echo "$polled"; return; }
+    [[ "$rec_id" =~ ^[A-Za-z0-9_-]+$ ]]      || { echo "$polled"; return; }
+    remembered=$(cat "${DURATION_DIR}/${rec_id}" 2>/dev/null)
+    [[ "$remembered" =~ ^[0-9]+$ && "$remembered" -gt 0 ]] || { echo "$polled"; return; }
+    if [[ "$remembered" != "$polled" ]]; then
+        log_warn "Recording $rec_id: poll reports ${polled}s but the Firebase start command said ${remembered}s — using ${remembered}s (backend duration mismatch)"
+    fi
+    echo "$remembered"
+}
+
+# Drop remembered durations left by recordings that finished long ago.
+_duration_prune() {
+    local now; now=$(date +%s)
+    local max_age=$(( DURATION_MAX_AGE_HOURS * 3600 ))
+    local f mtime
+    for f in "$DURATION_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        mtime=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+        (( now - mtime > max_age )) && rm -f "$f"
+    done
 }
 
 # ---- Dispatch a single recording; atomic claim avoids double-start -----
@@ -1259,6 +1315,7 @@ _dispatch() {
         site_name=$(echo "$rec" | jq -r '.site_name          // empty')
         rtsp=$(echo "$rec"      | jq -r '.camera_url         // empty')
         dur_sec=$(_duration_sec "$rec" "${rec_id:-?}")
+        dur_sec=$(_duration_preferred "${rec_id:-?}" "$dur_sec")
 
         _dispatch_one "$rec_id" "$cam_id" "$cam_name" "$dur_sec" "$rtsp" "$site_name" \
             && dispatched=$(( dispatched + 1 ))
@@ -1457,6 +1514,7 @@ _firebase_loop() {
                     cam_name=$(echo "$line" | jq -r '.camera_name      // .camera_id // empty' 2>/dev/null)
                     rtsp=$(echo "$line"     | jq -r '.camera_url       // empty' 2>/dev/null)
                     dur=$(_duration_sec "$line" "$rec_id")
+                    _duration_remember "$rec_id" "$dur"
                     # Prefer the resolved site name; else a stable site-<id> folder.
                     local site_label="$CLIENT_SITE_NAME"
                     [[ -z "$site_label" && -n "$cmd_site" ]] && site_label="site-${cmd_site}"
@@ -1488,6 +1546,7 @@ _poll() {
     mkdir -p "$TMP_DIR" "$ACTIVE_DIR" "$SPOOL_DIR" 2>/dev/null || true
     _reap_stale_ffmpeg   # clear captures that outlived their recording
     _spool_drain         # ship anything the network refused earlier
+    _duration_prune      # forget durations from long-finished recordings
 
     local resp http_code tmp
     tmp=$(mktemp)
