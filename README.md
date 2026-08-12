@@ -367,12 +367,28 @@ Recording <id>: dispatching (cam=..., site=..., 1800s)
 Compare that against the duration picked in the dashboard — if they disagree,
 the problem is upstream of this script.
 
-### When a capture ends early
+### Segmented capture
 
-A dropped RTSP session, a stalled camera, or an encoder that cannot keep up can
-end a capture before the requested duration. The daemon then records **only the
-part still missing** (up to `RECORDING_MAX_ATTEMPTS` attempts) and joins the
-pieces into one file — what was already captured is never discarded.
+A recording is captured in windows of `SEGMENT_DURATION` (default 600s) and the
+segments are joined into a single file before upload — the API takes one URL per
+recording, so this is a capture-level split, not a segmented upload like the
+macOS client does.
+
+A dropped RTSP session, a stalled camera, or an encoder that cannot keep up
+therefore costs one window instead of the whole recording, and the deadline
+watchdog notices a wedged capture within `SEGMENT_DURATION + 60` rather than
+after the full duration. The next pass re-records **only the part still
+missing**, so what was already captured is never discarded:
+
+```
+Recording 148: capturing 1800s in segments of up to 600s
+Recording 148: segment came back 240s of 600s (1/3 consecutive short) — captured 840s of 1800s, resuming
+Recording 148: joining 4 segments (1800s total)
+```
+
+The retry budget counts **consecutive** short segments, so a camera that blips
+occasionally through a long recording still delivers the full length, while one
+that has genuinely died stops the loop after `RECORDING_MAX_ATTEMPTS`.
 
 The reported duration is always the length of the file that was actually
 uploaded, never the requested length, so a short recording is visible rather
@@ -392,7 +408,8 @@ ffmpeg deadline exceeded for ... — terminating     # encoder could not keep up
 | `UPLOAD_RETRIES` | `3` | Max Azure upload attempts |
 | `UPLOAD_RETRY_DELAY` | `10` | Seconds between upload retries |
 | `RECORDING_COMPLETE_PCT` | `95` | Share of the requested duration a capture must cover to count as complete |
-| `RECORDING_MAX_ATTEMPTS` | `3` | Capture attempts per recording — each one records only the part still missing |
+| `SEGMENT_DURATION` | `600` | Capture window length; segments are joined into one file before upload |
+| `RECORDING_MAX_ATTEMPTS` | `3` | Consecutive short segments tolerated before giving up |
 | `RECORDING_DEFAULT_SEC` | `3600` | Fallback only, used when a start payload carries no recognizable duration field |
 | `FFMPEG_RW_TIMEOUT_US` | `15000000` | ffmpeg RTSP socket timeout (µs). Bounds a camera that accepts the connection then stops sending |
 | `FFMPEG_TERM_GRACE` | `10` | Seconds ffmpeg gets to finalize on SIGTERM before SIGKILL |

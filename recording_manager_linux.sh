@@ -324,6 +324,10 @@ FIREBASE_RESTART_DELAY=${FIREBASE_RESTART_DELAY:-15}
 # 15-minute file that was still reported as a full-length success.
 RECORDING_COMPLETE_PCT=${RECORDING_COMPLETE_PCT:-95}
 RECORDING_MAX_ATTEMPTS=${RECORDING_MAX_ATTEMPTS:-3}
+# Captures are taken in windows of this length and joined at the end, so a
+# stream that drops costs one window rather than the whole recording. Longer
+# windows mean fewer files; shorter ones bound how much a single failure loses.
+SEGMENT_DURATION=${SEGMENT_DURATION:-600}
 # Used only when a start payload carries no recognizable duration field.
 RECORDING_DEFAULT_SEC=${RECORDING_DEFAULT_SEC:-3600}
 # RTSP socket I/O timeout. Without it a stalled read is invisible until the
@@ -778,7 +782,10 @@ _reap_stale_ffmpeg() {
         [[ -z "$pid" ]] && continue
         kill -0 "$pid" 2>/dev/null || continue
         args=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
-        rid=$(sed -nE 's|.*/rec_([^/[:space:]]+)_p[0-9]+\.mp4.*|\1|p' <<<"$args")
+        # Matches both the current segment names (rec_<id>_sNNN.mp4) and the
+        # part names an older build used (rec_<id>_pNN.mp4), so a rolling
+        # update does not walk past captures started by the previous version.
+        rid=$(sed -nE 's|.*/rec_([^/[:space:]]+)_[sp][0-9]+\.mp4.*|\1|p' <<<"$args")
         if [[ -n "$rid" && -d "${ACTIVE_DIR}/${rid}" ]]; then
             log_debug "ffmpeg pid=$pid belongs to active recording $rid — leaving it"
             continue
@@ -1025,46 +1032,68 @@ _run_recording() {
 
     log "Recording $rec_id: starting (cam=$cam_name, site=$site_name, ${dur_sec}s)"
 
-    # A capture that ends early — dropped RTSP session, deadline, encoder that
-    # could not keep up — leaves a gap. Each attempt records only the part still
-    # missing into its own file, and the parts are joined at the end: what was
-    # already captured is never thrown away, and the total can actually reach
-    # the requested length instead of topping out at one attempt's worth.
+    # Capture in segments rather than one long ffmpeg run. A dropped RTSP
+    # session, a stalled camera or an encoder that falls behind then costs one
+    # segment instead of the whole recording, and the deadline watchdog notices
+    # a wedged capture within SEGMENT_DURATION+60 instead of the full duration.
+    # Each pass records the next window, or re-records whatever the last one
+    # left missing; the pieces are joined into a single file at the end, because
+    # this API takes one URL per recording.
     local min_dur=$(( dur_sec * RECORDING_COMPLETE_PCT / 100 ))
-    local attempt=0 captured=0 last_err=""
+    local captured=0 seg_idx=0 short_runs=0 last_err=""
     local -a parts=()
 
-    while (( attempt < RECORDING_MAX_ATTEMPTS && captured < min_dur )); do
-        attempt=$(( attempt + 1 ))
-        local remaining=$(( dur_sec - captured ))
-        local part; part=$(printf '%s/rec_%s_p%02d.mp4' "$TMP_DIR" "$rec_id" "$attempt")
+    log "Recording $rec_id: capturing ${dur_sec}s in segments of up to ${SEGMENT_DURATION}s"
 
-        _ffmpeg_record "$rtsp" "$part" "$remaining" "$stopflag"
+    while (( captured < dur_sec )); do
+        # This pass covers the next segment, or the tail if less than one
+        # segment is left. After a short segment it covers the gap instead.
+        local want=$(( dur_sec - captured ))
+        (( want > SEGMENT_DURATION )) && want=$SEGMENT_DURATION
 
+        local part; part=$(printf '%s/rec_%s_s%03d.mp4' "$TMP_DIR" "$rec_id" "$seg_idx")
+        _ffmpeg_record "$rtsp" "$part" "$want" "$stopflag"
+
+        local got=0
         if [[ -s "$part" ]]; then
-            local part_dur; part_dur=$(_probe_duration "$part")
+            got=$(_probe_duration "$part")
             parts+=("$part")
-            captured=$(( captured + part_dur ))
+            seg_idx=$(( seg_idx + 1 ))
+            captured=$(( captured + got ))
         else
             last_err=$(grep -v "^$" "${part}.err" 2>/dev/null | tail -5 | tr '\n' ' ')
             rm -f "$part" "${part}.err"
         fi
 
-        # An explicit early-stop ends the recording now — keep whatever was
-        # captured and skip the resume logic below.
+        # An explicit early-stop ends the recording now — keep what was captured
+        # and skip the resume logic below.
         if [[ -f "$stopflag" ]]; then
             log "Recording $rec_id: stopped on command — finalizing"
             break
         fi
 
-        (( captured >= min_dur )) && break
+        (( captured >= dur_sec )) && break
 
-        if (( ${#parts[@]} == 0 )); then
-            log_error "Recording $rec_id: ffmpeg produced nothing for camera '$cam_name' (${rtsp%%@*}), attempt $attempt/$RECORDING_MAX_ATTEMPTS — ${last_err:-no output}"
+        # A segment that came back short means the stream faltered. The budget
+        # counts *consecutive* short segments, so a dead camera stops the loop
+        # while a long recording survives blips scattered through it — each
+        # healthy segment advances the capture, so this still terminates.
+        if (( got < want * RECORDING_COMPLETE_PCT / 100 )); then
+            short_runs=$(( short_runs + 1 ))
+            if (( short_runs >= RECORDING_MAX_ATTEMPTS )); then
+                if (( ${#parts[@]} == 0 )); then
+                    log_error "Recording $rec_id: ffmpeg produced nothing for camera '$cam_name' (${rtsp%%@*}) in $short_runs attempts — ${last_err:-no output}"
+                else
+                    log_warn "Recording $rec_id: giving up after $short_runs short segments — captured ${captured}s of ${dur_sec}s"
+                fi
+                break
+            fi
+            log_warn "Recording $rec_id: segment came back ${got}s of ${want}s (${short_runs}/${RECORDING_MAX_ATTEMPTS} consecutive short) — captured ${captured}s of ${dur_sec}s, resuming"
+            sleep 5
         else
-            log_warn "Recording $rec_id: captured ${captured}s of ${dur_sec}s after attempt $attempt/$RECORDING_MAX_ATTEMPTS — resuming for the remaining $(( dur_sec - captured ))s"
+            short_runs=0
+            log_debug "Recording $rec_id: segment $seg_idx done (${got}s) — ${captured}s of ${dur_sec}s"
         fi
-        (( attempt < RECORDING_MAX_ATTEMPTS )) && sleep 5
     done
 
     # Nothing at all was captured across every attempt — report failed and bail.
@@ -1077,15 +1106,18 @@ _run_recording() {
 
     if (( ${#parts[@]} == 1 )); then
         mv -f "${parts[0]}" "$rec_file"
-    elif ! _concat_parts "$rec_file" "${parts[@]}"; then
-        # Joining failed: ship the longest single part rather than nothing.
-        local best="${parts[0]}" best_dur=0 p p_dur
-        for p in "${parts[@]}"; do
-            p_dur=$(_probe_duration "$p")
-            (( p_dur > best_dur )) && { best="$p"; best_dur=$p_dur; }
-        done
-        log_warn "Recording $rec_id: could not join ${#parts[@]} parts — uploading the longest (${best_dur}s)"
-        mv -f "$best" "$rec_file"
+    else
+        log "Recording $rec_id: joining ${#parts[@]} segments (${captured}s total)"
+        if ! _concat_parts "$rec_file" "${parts[@]}"; then
+            # Joining failed: ship the longest segment rather than nothing.
+            local best="${parts[0]}" best_dur=0 p p_dur
+            for p in "${parts[@]}"; do
+                p_dur=$(_probe_duration "$p")
+                (( p_dur > best_dur )) && { best="$p"; best_dur=$p_dur; }
+            done
+            log_warn "Recording $rec_id: could not join ${#parts[@]} segments — uploading the longest (${best_dur}s)"
+            mv -f "$best" "$rec_file"
+        fi
     fi
     rm -f "${parts[@]}" "${parts[@]/%/.err}"
 
@@ -1108,7 +1140,7 @@ _run_recording() {
     log "Recording $rec_id: ffmpeg done (${report_dur}s of ${dur_sec}s, ${sz}B), uploading..."
 
     if [[ ! -f "$stopflag" ]] && (( report_dur < min_dur )); then
-        log_warn "Recording $rec_id: SHORT — captured ${report_dur}s of the requested ${dur_sec}s after $attempt attempt(s); uploading what there is"
+        log_warn "Recording $rec_id: SHORT — captured ${report_dur}s of the requested ${dur_sec}s across ${#parts[@]} segment(s); uploading what there is"
     fi
 
     local stop_time; stop_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
