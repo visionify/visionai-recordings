@@ -14,3 +14,8 @@ redeploy_macos.txt
 
 __pycache__/
 *.pyc
+
+# Device access notes — plaintext credentials, never commit
+edges.txt
+cameras.txt
+connected_devices.txt
