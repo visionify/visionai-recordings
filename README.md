@@ -102,11 +102,84 @@ recordings/<camera>/<camera>-<YYYYMMDD-HHMMSS>-001.mp4
 |----------|---------|-------------|
 | `POLL_INTERVAL` | `300` | Seconds between API polls |
 | `SEGMENT_DURATION` | `600` | Seconds per video segment |
-| `UPLOAD_RETRIES` | `3` | Max S3 upload attempts per segment |
-| `UPLOAD_RETRY_DELAY` | `10` | Seconds between upload retries |
-| `PYTHON_BIN` | auto-detected | Path to Python 3 with boto3 |
+| `UPLOAD_RETRIES` | `3` | Max upload attempts per segment before it is spooled |
+| `UPLOAD_RETRY_DELAY` | `10` | Base seconds between upload retries — doubles each attempt |
+| `UPLOAD_CHUNK_MB` | `1` | Upload chunk size (MiB). A network blip costs at most one chunk, so keep this small on weak uplinks |
+| `UPLOAD_SOCKET_TIMEOUT` | `120` | Per-chunk socket timeout (seconds) |
+| `FFMPEG_RW_TIMEOUT_US` | `15000000` | ffmpeg RTSP read timeout (µs). Bounds a camera that accepts the connection then stops sending |
+| `WORK_DIR` | `/var/lib/visionai/rec-work` | In-flight segments. Deliberately not under `/tmp` — the macOS reaper deletes untouched `/tmp` files after ~3 days |
+| `SPOOL_DIR` | `/var/lib/visionai/rec-spool` | Retry backlog for segments whose upload failed |
+| `SPOOL_MAX_GB` | `5` | Disk ceiling for the backlog; oldest evicted first past the cap |
+| `SPOOL_MAX_AGE_HOURS` | `48` | Spooled segments older than this are dropped |
+| `SPOOL_DRAIN_PER_POLL` | `6` | Max spooled segments retried per poll, so a backlog can't starve new recordings |
+| `PYTHON_BIN` | auto-detected | Path to Python 3 with boto3 / azure-storage-blob |
 | `SERVER_ID` | — | Only process recordings for this server |
 | `DEBUG` | `0` | Set to `1` for verbose logging |
+
+### Media URLs: permanent CDN links
+
+By default, when a CDN host is configured the manager returns a **permanent**
+URL with no SAS/presigned token:
+
+```
+https://<cdn-host>/<container>/recordings/<camera>/<file>.mp4
+```
+
+Signed URLs expire (7 days), and that URL is stored in the backend against the
+recording — so an archive built on signed URLs quietly fills with dead links.
+Permanent CDN links avoid that. Set `CDN_PUBLIC_URLS=0` to go back to signed
+URLs if you need expiry.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CDN_PUBLIC_URLS` | `1` when a CDN host is set, else `0` | `1` = permanent unsigned CDN URL; `0` = expiring signed URL |
+| `CDN_BASE_URL` | falls back to `AZURE_CDN_BASE_URL` | CDN / Front Door host |
+
+**These only work if the object is reachable without a token** — either a
+public-read container, or a CDN that authenticates to a private origin.
+
+**Path shape is verified at startup, not assumed.** Whether the container name
+belongs in the CDN path is deployment-specific, and getting it wrong yields URLs
+that 404 — invisibly, since nobody notices until they try to play a clip weeks
+later. On startup the manager uploads a few-byte probe object, tries each path
+shape, keeps whichever returns HTTP 200, and logs a correction if the configured
+`AZURE_CDN_INCLUDE_CONTAINER` was wrong. If no shape works it falls back to
+signed URLs rather than emitting links that don't resolve.
+
+**Content type matters for playback.** Blobs are uploaded as `video/mp4` /
+`image/jpeg` with `Content-Disposition: inline`. Without this Azure stores
+everything as `application/octet-stream` and the browser *downloads* the
+recording instead of playing it — `<video>` and `<img>` both fail on the URL.
+Combined with `-movflags +faststart` on capture and the CDN's `accept-ranges:
+bytes`, the resulting URL plays and seeks directly in a browser.
+
+> Clips uploaded before this change still carry `application/octet-stream` and
+> will download rather than play. Fixing them is a metadata-only backfill — see
+> `scripts/backfill_content_type.py`.
+
+### Upload spool — what happens when the network is bad
+
+A segment whose upload fails every attempt is **never deleted**. It is moved to
+`SPOOL_DIR` with a sidecar recording which recording and segment index it belongs
+to, and retried on subsequent polls. When it finally uploads, its URL is patched
+into that recording's segment list and re-pushed to the API.
+
+Two consequences worth knowing:
+
+- The video is uploaded **before** its thumbnail, and no thumbnail is uploaded for a
+  segment whose video failed. Previously the thumbnail (~50 KB) went first and
+  almost always succeeded while the video (tens of MB) timed out, so the API was
+  told about a segment with a working `thumbnail_url` and an empty `url` — a lost
+  recording that looked like a successful one.
+- Backlog is bounded by `SPOOL_MAX_GB` and `SPOOL_MAX_AGE_HOURS`. Eviction is
+  logged at ERROR, because it means a recording was genuinely lost.
+
+Inspect the backlog:
+
+```bash
+ls -lh /var/lib/visionai/rec-spool/*.mp4        # segments awaiting upload
+grep -E "Spool:" /var/log/visionai/recording-manager.log | tail -20
+```
 
 ### Troubleshooting (macOS)
 
