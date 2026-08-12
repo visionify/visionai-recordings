@@ -11,3 +11,6 @@ redeploy_macos.txt
 .DS_Store
 *.swp
 *~
+
+__pycache__/
+*.pyc
