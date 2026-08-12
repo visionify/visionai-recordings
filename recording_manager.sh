@@ -809,9 +809,12 @@ _reap_stale_ffmpeg() {
     # macOS ps has no `etimes` (that is a Linux/procps keyword — it errors out
     # with "keyword not found", which would make this reaper silently do
     # nothing). Parse the portable `etime` form: [[DD-]HH:]MM:SS.
+    # Match the legacy /tmp path too. The processes this was written to clean up
+    # were started by an older build and are still writing to /tmp/visionai-rec,
+    # so matching only the new WORK_DIR would walk straight past them.
     done < <(ps -eo pid=,etime=,args= \
-             | awk -v now="$now" -v dir="$WORK_DIR" '
-                 index($0, "ffmpeg") && index($0, dir) && !index($0, "awk") {
+             | awk -v now="$now" -v dir="$WORK_DIR" -v legacy="/tmp/visionai-rec" '
+                 index($0, "ffmpeg") && (index($0, dir) || index($0, legacy)) && !index($0, "awk") {
                      e = $2; d = 0
                      if (e ~ /-/) { split(e, p, "-"); d = p[1]; e = p[2] }
                      n = split(e, t, ":")
