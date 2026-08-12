@@ -20,7 +20,11 @@
 #   sudo systemctl disable visionai-recording-manager
 #   sudo rm /etc/systemd/system/visionai-recording-manager.service
 #   sudo rm /usr/local/bin/visionai-recording-manager
+#   sudo rm -f /etc/logrotate.d/visionai-recording-manager
 #   sudo systemctl daemon-reload
+#   # /var/lib/visionai holds the upload spool — check it is empty before
+#   # removing it, or you discard recordings that never reached the cloud:
+#   #   ls /var/lib/visionai/rec/spool && sudo rm -rf /var/lib/visionai
 #
 # ── Daemon env vars (set in ENV_FILE) ────────────────────────────────────────
 #   Required: VISIONAI_API_ENDPOINT  VISIONAI_API_TOKEN
@@ -202,7 +206,16 @@ Type=simple
 ExecStart=/bin/bash ${INSTALL_BIN}
 Restart=always
 RestartSec=10
-TimeoutStopSec=20
+# A capture in flight gets time to finalize its mp4 before systemd escalates to
+# SIGKILL. The old 20s could cut a stop/restart mid-write, losing the moov atom
+# and with it the whole recording.
+TimeoutStopSec=90
+# Captures and the upload spool live here (creates /var/lib/visionai, 0750).
+# NOT under /tmp: systemd clears /tmp at boot, which would delete spooled
+# recordings that are waiting out a network outage.
+StateDirectory=visionai
+StateDirectoryMode=0750
+Environment=WORK_DIR=/var/lib/visionai/rec
 Environment=ENV_FILE=${ENV_FILE}
 Environment=LOG_FILE=${LOG_DIR}/recording-manager.log
 Environment=PYTHON_BIN=${VENV_DIR}/bin/python3
@@ -213,6 +226,26 @@ SERVICE_EOF
 
     chmod 644 "$SERVICE_FILE"
     ok "Service file: $SERVICE_FILE"
+
+    # ── Log rotation ──────────────────────────────────────────────────────────
+    # The daemon appends to one file forever; on a busy site with DEBUG=1 that
+    # is the thing that eventually fills the disk. copytruncate because the
+    # daemon holds the fd open via `exec >>` and never reopens it.
+    step "Configuring log rotation..."
+    cat > /etc/logrotate.d/visionai-recording-manager << 'LOGROTATE_EOF'
+/var/log/visionai/recording-manager.log {
+    daily
+    rotate 14
+    maxsize 100M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+LOGROTATE_EOF
+    chmod 644 /etc/logrotate.d/visionai-recording-manager
+    ok "Log rotation: /etc/logrotate.d/visionai-recording-manager (14 days, 100MB cap)"
 
     # ── Enable and start ──────────────────────────────────────────────────────
     step "Enabling and starting service..."
@@ -262,11 +295,43 @@ UPLOAD_RETRIES=${UPLOAD_RETRIES:-3}
 UPLOAD_RETRY_DELAY=${UPLOAD_RETRY_DELAY:-10}
 ENV_FILE=${ENV_FILE:-${HOME}/.visionai/.env}
 LOG_FILE=${LOG_FILE:-/var/log/visionai/recording-manager.log}
-TMP_DIR=/tmp/visionai-rec
+# Captures and the upload spool live on real disk, NOT under /tmp. systemd
+# clears /tmp at boot and prunes it on a timer (`D /tmp … 30d`), and on modern
+# Ubuntu /tmp is tmpfs — so a spooled recording waiting out a network outage
+# would be written to RAM and then deleted by a reboot, which is precisely the
+# data it exists to protect. Falls back to the legacy path when the state dir
+# cannot be created (non-root run).
+LEGACY_TMP_DIR=/tmp/visionai-rec
+WORK_DIR=${WORK_DIR:-/var/lib/visionai/rec}
+if ! mkdir -p "$WORK_DIR" 2>/dev/null; then
+    WORK_DIR=$LEGACY_TMP_DIR
+fi
+TMP_DIR=$WORK_DIR
 ACTIVE_DIR=$TMP_DIR/active
+SPOOL_DIR=${SPOOL_DIR:-$TMP_DIR/spool}
 PID_FILE=/var/run/visionai-recording-manager.pid
 LISTENER_SCRIPT=$TMP_DIR/firebase_listener.py
+# Spool ceilings — a permanently broken uplink must not fill the disk.
+SPOOL_MAX_AGE_HOURS=${SPOOL_MAX_AGE_HOURS:-72}
+SPOOL_MAX_MB=${SPOOL_MAX_MB:-20000}
+# Refuse to start a capture when the work disk is this low (MB). A recording
+# that runs the disk to zero takes the daemon's logs and spool down with it.
+MIN_FREE_MB=${MIN_FREE_MB:-2000}
 FIREBASE_RESTART_DELAY=${FIREBASE_RESTART_DELAY:-15}
+# A capture counts as complete once it covers this share of the requested
+# window. It is deliberately close to 100: the previous rule accepted anything
+# past the halfway mark, which silently turned a 30-minute request into a
+# 15-minute file that was still reported as a full-length success.
+RECORDING_COMPLETE_PCT=${RECORDING_COMPLETE_PCT:-95}
+RECORDING_MAX_ATTEMPTS=${RECORDING_MAX_ATTEMPTS:-3}
+# Used only when a start payload carries no recognizable duration field.
+RECORDING_DEFAULT_SEC=${RECORDING_DEFAULT_SEC:-3600}
+# RTSP socket I/O timeout. Without it a stalled read is invisible until the
+# capture's deadline, so the recording just ends short; with it ffmpeg fails
+# fast and the attempt loop resumes for the part that is missing.
+FFMPEG_RW_TIMEOUT_US=${FFMPEG_RW_TIMEOUT_US:-15000000}
+# Seconds to let ffmpeg finalize on SIGTERM before escalating to SIGKILL.
+FFMPEG_TERM_GRACE=${FFMPEG_TERM_GRACE:-10}
 # Azure Blob layout: <container>/<prefix>/<site_uuid>/<camera>-<timestamp>.mp4
 AZURE_CONTAINER=${AZURE_CONTAINER:-recordings}
 AZURE_BLOB_PREFIX=${AZURE_BLOB_PREFIX:-raw-recordings}
@@ -276,7 +341,7 @@ CLIENT_SITE_NAME=""
 CLIENT_SITE_UUID=""
 CLIENT_FIREBASE_PATH=""   # recording-commands/{site_uuid} — listener scope
 
-mkdir -p "$(dirname "$LOG_FILE")" "$TMP_DIR" "$ACTIVE_DIR"
+mkdir -p "$(dirname "$LOG_FILE")" "$TMP_DIR" "$ACTIVE_DIR" "$SPOOL_DIR"
 exec >> "$LOG_FILE" 2>&1
 
 _ts()       { date '+%Y-%m-%d %H:%M:%S'; }
@@ -320,6 +385,34 @@ _check_vars() {
     fi
 }
 _check_vars
+
+# ---- URL style: permanent CDN link vs time-limited signed link ---------
+# Resolved here, after the env file is loaded, because the defaults below are
+# derived from whether a CDN host was configured.
+#
+# A signed URL expires, and that URL is what the backend stores against the
+# recording — so an archive built on signed links quietly fills with dead
+# playback URLs that nobody notices until someone opens a clip weeks later.
+# When a CDN host is configured, hand back a permanent unsigned URL instead.
+# That is only safe where the CDN (or a public-read container) is what governs
+# access; set CDN_PUBLIC_URLS=0 to keep expiry.
+CDN_BASE_URL=${CDN_BASE_URL:-${AZURE_CDN_BASE_URL:-}}
+AZURE_CDN_INCLUDE_CONTAINER=${AZURE_CDN_INCLUDE_CONTAINER:-0}
+AZURE_SAS_EXPIRY_DAYS=${AZURE_SAS_EXPIRY_DAYS:-7}
+if [[ -n "$CDN_BASE_URL" ]]; then
+    CDN_PUBLIC_URLS=${CDN_PUBLIC_URLS:-1}
+else
+    CDN_PUBLIC_URLS=${CDN_PUBLIC_URLS:-0}
+fi
+if [[ "$CDN_PUBLIC_URLS" == "1" && -z "$CDN_BASE_URL" ]]; then
+    log_warn "CDN_PUBLIC_URLS=1 but no CDN base URL configured — falling back to signed URLs"
+    CDN_PUBLIC_URLS=0
+fi
+if [[ "$CDN_PUBLIC_URLS" == "1" ]]; then
+    log "URL style: permanent CDN links via ${CDN_BASE_URL}"
+else
+    log "URL style: signed links (expire after ${AZURE_SAS_EXPIRY_DAYS}d)"
+fi
 
 for _cmd in jq ffmpeg curl; do
     command -v "$_cmd" >/dev/null 2>&1 || { log_error "$_cmd not found — install it first"; exit 1; }
@@ -483,6 +576,8 @@ _fetch_site_context() {
 }
 
 # ---- Create the recordings container if it doesn't exist ---------------
+# Echoes the container's public access level ("blob", "container", or
+# "private"), which decides whether permanent CDN URLs can resolve at all.
 _ensure_container() {
     "$PYTHON_BIN" - "$EVENTS_AZURE_BLOB_CONNECTION_STRING" "$AZURE_CONTAINER" 2>/dev/null <<'PYEOF' || true
 import sys
@@ -491,14 +586,21 @@ conn_str, container = sys.argv[1:3]
 client = BlobServiceClient.from_connection_string(conn_str)
 container_client = client.get_container_client(container)
 try:
-    container_client.get_container_properties()
+    props = container_client.get_container_properties()
 except Exception:
+    # Created private: making a container world-readable is not a decision this
+    # daemon should take on its own. Permanent CDN URLs then need either an
+    # operator to set public access, or a CDN that authenticates to the origin.
     container_client.create_container()
-    print(f"Created container: {container}")
+    print("created:private")
+else:
+    print(f"exists:{props.public_access or 'private'}")
 PYEOF
 }
 
-# ---- Upload file to Azure Blob Storage, return SAS URL or empty --------
+# ---- Upload file to Azure Blob Storage, return playable URL or empty ---
+# Returns a permanent CDN URL when CDN_PUBLIC_URLS=1, otherwise a SAS URL that
+# expires after AZURE_SAS_EXPIRY_DAYS.
 _azure_upload() {
     local file="$1" blob_name="$2"
     local attempt=1
@@ -506,25 +608,56 @@ _azure_upload() {
     while [[ $attempt -le $UPLOAD_RETRIES ]]; do
         local result
         result=$("$PYTHON_BIN" - "$file" "$AZURE_CONTAINER" \
-                "$blob_name" "$EVENTS_AZURE_BLOB_CONNECTION_STRING" 2>&1 <<'PYEOF'
+                "$blob_name" "$EVENTS_AZURE_BLOB_CONNECTION_STRING" \
+                "${CDN_BASE_URL:-}" "$AZURE_CDN_INCLUDE_CONTAINER" \
+                "$AZURE_SAS_EXPIRY_DAYS" "$CDN_PUBLIC_URLS" 2>&1 <<'PYEOF'
 import sys
-from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from azure.storage.blob import (BlobServiceClient, generate_blob_sas,
+                                BlobSasPermissions, ContentSettings)
 from datetime import datetime, timedelta, timezone
-file_path, container, blob_name, conn_str = sys.argv[1:]
+(file_path, container, blob_name, conn_str,
+ cdn_base_url, cdn_include_container, sas_expiry_days, public_urls) = sys.argv[1:]
 try:
     client = BlobServiceClient.from_connection_string(conn_str)
     blob_client = client.get_blob_client(container=container, blob=blob_name)
-    with open(file_path, "rb") as f:
-        blob_client.upload_blob(f, overwrite=True)
-    sas_token = generate_blob_sas(
-        account_name=client.account_name,
-        container_name=container,
-        blob_name=blob_name,
-        account_key=client.credential.account_key,
-        permission=BlobSasPermissions(read=True),
-        expiry=datetime.now(timezone.utc) + timedelta(days=7),
+
+    # Without an explicit content type Azure stores every blob as
+    # application/octet-stream, and a browser then DOWNLOADS the recording
+    # instead of playing it — <video> and <img> both fail on the returned URL.
+    # `inline` keeps the browser from treating it as an attachment.
+    import mimetypes as _mt
+    guessed = _mt.guess_type(file_path)[0]
+    if file_path.endswith(".mp4"):
+        guessed = "video/mp4"
+    content_settings = ContentSettings(
+        content_type=guessed or "application/octet-stream",
+        content_disposition="inline",
     )
-    print(f"{blob_client.url}?{sas_token}")
+    with open(file_path, "rb") as f:
+        blob_client.upload_blob(f, overwrite=True, content_settings=content_settings)
+
+    def _cdn_url(suffix=""):
+        host = cdn_base_url.split("://", 1)[-1].rstrip("/")
+        path = f"{container}/{blob_name}" if cdn_include_container == "1" else blob_name
+        return f"https://{host}/{path}{suffix}"
+
+    # A permanent CDN URL carries no SAS token, so it never expires — which is
+    # the point, but it also means the object is reachable by anyone holding the
+    # link. That is only safe when the CDN/Front Door origin is what enforces
+    # access; the blob container itself must not be left publicly enumerable.
+    if public_urls == "1" and cdn_base_url:
+        print(_cdn_url())
+    else:
+        sas_token = generate_blob_sas(
+            account_name=client.account_name,
+            container_name=container,
+            blob_name=blob_name,
+            account_key=client.credential.account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.now(timezone.utc) + timedelta(days=int(sas_expiry_days)),
+        )
+        print(_cdn_url(f"?{sas_token}") if cdn_base_url
+              else f"{blob_client.url}?{sas_token}")
 except Exception as e:
     print(f"ERROR: {e}", file=sys.stderr)
     sys.exit(1)
@@ -542,6 +675,220 @@ PYEOF
 
 _file_size() { stat -c%s "$1" 2>/dev/null || echo 0; }
 
+# ---- Upload spool: keep the bytes when the network refuses them --------
+#
+# An upload that exhausts its retries used to end with `rm -f "$rec_file"`,
+# which turns a transient uplink problem into permanent data loss: the camera
+# footage is gone and the recording is marked failed. Instead, park the file
+# with a sidecar describing where it was headed, and retry on later polls.
+_spool_put() {
+    local file="$1" rec_id="$2" cam_id="$3" blob_path="$4" thumb_path="$5" \
+          start_time="$6" stop_time="$7" duration="$8"
+    local base="${SPOOL_DIR}/${rec_id}"
+
+    mkdir -p "$SPOOL_DIR" 2>/dev/null || return 1
+    mv -f "$file" "${base}.mp4" 2>/dev/null || return 1
+    jq -n --arg rid "$rec_id" --arg cid "$cam_id" --arg bp "$blob_path" \
+          --arg tp "$thumb_path" --arg st "$start_time" --arg et "$stop_time" \
+          --argjson dur "$duration" \
+        '{recording_id:$rid,camera_id:$cid,blob_path:$bp,thumb_path:$tp,
+          start_time:$st,stop_time:$et,duration:$dur}' > "${base}.json" 2>/dev/null \
+        || { rm -f "${base}.mp4"; return 1; }
+    log_warn "Recording $rec_id: upload failed — spooled $(_file_size "${base}.mp4")B for retry"
+    return 0
+}
+
+# Enforce the spool ceilings, oldest first: a stale clip is worth less than a
+# working disk, and an unbounded spool is its own outage.
+_spool_prune() {
+    local now; now=$(date +%s)
+    local max_age=$(( SPOOL_MAX_AGE_HOURS * 3600 ))
+    local f mtime
+
+    for f in "$SPOOL_DIR"/*.mp4; do
+        [[ -f "$f" ]] || continue
+        mtime=$(stat -c %Y "$f" 2>/dev/null || echo "$now")
+        if (( now - mtime > max_age )); then
+            log_warn "Spool: dropping $(basename "$f") — older than ${SPOOL_MAX_AGE_HOURS}h"
+            rm -f "$f" "${f%.mp4}.json"
+        fi
+    done
+
+    local used_mb
+    used_mb=$(du -sm "$SPOOL_DIR" 2>/dev/null | cut -f1); used_mb=${used_mb:-0}
+    (( used_mb <= SPOOL_MAX_MB )) && return 0
+    while read -r f; do
+        [[ -f "$f" ]] || continue
+        (( used_mb <= SPOOL_MAX_MB )) && break
+        local mb; mb=$(( $(_file_size "$f") / 1048576 ))
+        log_warn "Spool: over ${SPOOL_MAX_MB}MB — dropping oldest $(basename "$f")"
+        rm -f "$f" "${f%.mp4}.json"
+        used_mb=$(( used_mb - mb ))
+    done < <(ls -1tr "$SPOOL_DIR"/*.mp4 2>/dev/null)
+}
+
+# Retry spooled uploads. Called from the poll loop, so a recording that could
+# not be shipped when it finished still lands once the network comes back.
+_spool_drain() {
+    _spool_prune
+    local f meta rec_id cam_id blob_path thumb_path start_time stop_time duration url thumb
+
+    for f in "$SPOOL_DIR"/*.mp4; do
+        [[ -f "$f" ]] || continue
+        meta="${f%.mp4}.json"
+        if [[ ! -f "$meta" ]]; then
+            log_warn "Spool: $(basename "$f") has no sidecar — dropping"
+            rm -f "$f"; continue
+        fi
+        rec_id=$(jq -r '.recording_id // empty' "$meta" 2>/dev/null)
+        cam_id=$(jq -r '.camera_id    // empty' "$meta" 2>/dev/null)
+        blob_path=$(jq -r '.blob_path // empty' "$meta" 2>/dev/null)
+        thumb_path=$(jq -r '.thumb_path // empty' "$meta" 2>/dev/null)
+        start_time=$(jq -r '.start_time // empty' "$meta" 2>/dev/null)
+        stop_time=$(jq -r '.stop_time  // empty' "$meta" 2>/dev/null)
+        duration=$(jq -r '.duration    // 0' "$meta" 2>/dev/null)
+        [[ -z "$rec_id" || -z "$blob_path" ]] && { log_warn "Spool: unusable sidecar $(basename "$meta") — dropping"; rm -f "$f" "$meta"; continue; }
+
+        log "Spool: retrying upload for recording $rec_id"
+        url=$(_azure_upload "$f" "$blob_path") || url=""
+        [[ -z "$url" ]] && { log_warn "Spool: recording $rec_id still not uploadable — leaving spooled"; continue; }
+
+        thumb=""
+        [[ -n "$thumb_path" ]] && { thumb=$(_upload_thumb "$f" "$thumb_path") || thumb=""; }
+        _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$duration" "$cam_id"
+        log "Recording $rec_id: completed from spool — $blob_path"
+        rm -f "$f" "$meta"
+    done
+}
+
+# ---- Reap ffmpeg left behind by a previous daemon generation -----------
+# systemd restarts the manager, but ffmpeg it had spawned keeps running and
+# keeps its RTSP session open. Those sessions compete with the inference engine
+# for single-consumer cameras, so clear them before starting new captures.
+#
+# Liveness is decided by the claim directory, not by a time limit: a capture
+# whose recording_id still holds a claim is this generation's and is left alone
+# no matter how long it has been running, so a legitimately long recording is
+# never cut short. $1 is a minimum age in seconds, which only guards against
+# racing a capture that has started but not yet had its claim observed.
+_reap_stale_ffmpeg() {
+    local min_age="${1:-300}"
+    local pid age args rid
+    while read -r pid age; do
+        [[ -z "$pid" ]] && continue
+        kill -0 "$pid" 2>/dev/null || continue
+        args=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+        rid=$(sed -nE 's|.*/rec_([^/[:space:]]+)_p[0-9]+\.mp4.*|\1|p' <<<"$args")
+        if [[ -n "$rid" && -d "${ACTIVE_DIR}/${rid}" ]]; then
+            log_debug "ffmpeg pid=$pid belongs to active recording $rid — leaving it"
+            continue
+        fi
+        if [[ -z "$rid" ]]; then
+            # Not a capture: the concat join or a thumbnail pass, neither of
+            # which carries a recording id. Both finish in seconds, so only
+            # reap one that has clearly wedged rather than racing a live one.
+            (( age < 3600 )) && continue
+        fi
+        log_error "Reaping orphaned ffmpeg pid=$pid (age $(( age / 60 ))m, recording ${rid:-unknown}) — it was holding an RTSP session"
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep 2
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    # Match the legacy /tmp work dir too: processes started by an older build
+    # are still writing there, and matching only WORK_DIR walks past them.
+    done < <(ps -eo pid=,etimes=,args= 2>/dev/null \
+             | awk -v age="$min_age" -v dir="$WORK_DIR" -v legacy="$LEGACY_TMP_DIR" '
+                 index($0, "ffmpeg") && (index($0, dir) || index($0, legacy)) \
+                 && !index($0, "awk") && $2 >= age { print $1, $2 }')
+}
+
+# ---- Free space on the work disk, in MB --------------------------------
+_free_mb() { df -Pm "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
+
+# ---- Verify permanent CDN URLs actually resolve ------------------------
+# Whether the container name belongs in the CDN path is deployment-specific,
+# and because the URL is written into the backend against the recording, a
+# wrong guess silently fills the archive with dead links that nobody notices
+# until someone tries to play a clip weeks later.
+#
+# So don't guess: upload a few bytes once at startup, try each path shape, and
+# keep the one that returns 200. If none does, fall back to signed URLs, which
+# expire but at least work.
+_probe_public_url() {
+    [[ "$CDN_PUBLIC_URLS" == "1" ]] || return 0
+
+    local probe="${TMP_DIR}/.cdn-probe"
+    local key="${AZURE_BLOB_PREFIX}/.cdn-probe.txt"
+    echo "visionai recording-manager cdn probe" > "$probe" 2>/dev/null || return 0
+
+    # Upload once — we only need the object to exist; the URL style used to put
+    # it there is irrelevant to what we are testing.
+    local saved="$CDN_PUBLIC_URLS"
+    CDN_PUBLIC_URLS=0
+    _azure_upload "$probe" "$key" >/dev/null 2>&1
+    CDN_PUBLIC_URLS="$saved"
+    rm -f "$probe"
+
+    local host; host=$(echo "$CDN_BASE_URL" | sed -E 's|^[a-z]+://||; s|/$||')
+    local shape code=""
+    for shape in "$AZURE_CDN_INCLUDE_CONTAINER" 1 0; do
+        if [[ "$shape" == "1" ]]; then
+            code=$(curl -sI -o /dev/null -w "%{http_code}" --max-time 20 "https://${host}/${AZURE_CONTAINER}/${key}" 2>/dev/null)
+        else
+            code=$(curl -sI -o /dev/null -w "%{http_code}" --max-time 20 "https://${host}/${key}" 2>/dev/null)
+        fi
+        if [[ "$code" == "200" ]]; then
+            if [[ "$AZURE_CDN_INCLUDE_CONTAINER" != "$shape" ]]; then
+                log_warn "CDN path shape corrected: AZURE_CDN_INCLUDE_CONTAINER=$shape (configured $AZURE_CDN_INCLUDE_CONTAINER returned 404)"
+            fi
+            AZURE_CDN_INCLUDE_CONTAINER="$shape"
+            log "CDN probe OK — permanent URLs resolve (HTTP 200, container-in-path=$shape)"
+            return 0
+        fi
+    done
+
+    log_error "CDN probe failed (last HTTP ${code:-none}) — permanent URLs would not resolve, falling back to signed URLs"
+    CDN_PUBLIC_URLS=0
+}
+
+# ---- RTSP socket timeout flag (name varies by ffmpeg version) ----------
+# ffmpeg <5 spells the RTSP demuxer's socket timeout `-stimeout`; 5.0 dropped
+# that name and moved it to `-timeout` (both in microseconds). Probe for the
+# one this build understands — passing the wrong flag makes ffmpeg exit
+# immediately, which is how the flags came to be dropped altogether. Check
+# `stimeout` first: on ffmpeg 4.x `-timeout` also exists but means the listen
+# timeout in *seconds*, so matching it there would buy no read protection.
+FFMPEG_RTSP_TIMEOUT_ARGS=()
+_detect_rtsp_timeout_flag() {
+    local help; help=$(ffmpeg -hide_banner -h demuxer=rtsp 2>/dev/null)
+    if grep -qE '^[[:space:]]+-stimeout[[:space:]]' <<<"$help"; then
+        FFMPEG_RTSP_TIMEOUT_ARGS=(-stimeout "$FFMPEG_RW_TIMEOUT_US")
+    elif grep -qE '^[[:space:]]+-timeout[[:space:]]' <<<"$help"; then
+        FFMPEG_RTSP_TIMEOUT_ARGS=(-timeout "$FFMPEG_RW_TIMEOUT_US")
+    else
+        log_warn "ffmpeg has no RTSP socket timeout option — a stalled stream will only be caught by the capture deadline"
+    fi
+}
+
+# ---- Stop an ffmpeg child, escalating if it ignores SIGTERM ------------
+# SIGTERM first so ffmpeg finalizes the moov atom (+faststart leaves a playable
+# partial). An ffmpeg blocked in a stalled RTSP read ignores TERM, and the old
+# code then fell into an unbounded `wait` — that is how captures survived for
+# days holding a camera's RTSP session against the inference engine. Never wait
+# forever on a process we have already decided to kill.
+_stop_ffmpeg() {
+    local pid="$1" out="$2"
+    kill -TERM "$pid" 2>/dev/null || true
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null && (( waited < FFMPEG_TERM_GRACE )); do
+        sleep 1; waited=$(( waited + 1 ))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        log_error "ffmpeg ignored SIGTERM for $out — SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+}
+
 # ---- ffmpeg capture with deadline watchdog; stderr saved to <out>.err ----
 # A non-empty $stopflag path that appears mid-capture triggers a graceful stop
 # (SIGTERM) so an in-progress recording can be ended early on command. ffmpeg
@@ -556,13 +903,13 @@ _ffmpeg_run() {
     while kill -0 "$pid" 2>/dev/null; do
         sleep 2
         if [[ -n "$stopflag" && -f "$stopflag" ]]; then
-            kill "$pid" 2>/dev/null || true
             log "ffmpeg stop requested for $out — ending early"
+            _stop_ffmpeg "$pid" "$out"
             break
         fi
         if [[ $(date +%s) -gt $deadline ]]; then
-            kill "$pid" 2>/dev/null || true
-            log_warn "ffmpeg deadline exceeded for $out — killed"
+            log_warn "ffmpeg deadline exceeded for $out — terminating"
+            _stop_ffmpeg "$pid" "$out"
             break
         fi
     done
@@ -574,15 +921,19 @@ _ffmpeg_record() {
     local errfile="${out}.err"
     local deadline=$(( $(date +%s) + dur + 60 ))
 
-    # Try transcoding (resize + re-encode)
+    # Try transcoding (resize + re-encode). `-t` bounds *stream* time, not wall
+    # time: an encoder that cannot sustain the input rate falls behind and gets
+    # cut off by the deadline with only part of the window captured, so the
+    # preset has to leave headroom on modest hardware.
     _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" "$stopflag" \
         ffmpeg \
         -rtsp_transport tcp \
+        ${FFMPEG_RTSP_TIMEOUT_ARGS[@]+"${FFMPEG_RTSP_TIMEOUT_ARGS[@]}"} \
         -i "$rtsp" \
         -t "$dur" \
         -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p" \
         -r 5 \
-        -c:v libx264 -preset medium -crf 26 \
+        -c:v libx264 -preset veryfast -crf 26 \
         -maxrate 400k -bufsize 800k \
         -profile:v high -pix_fmt yuv420p \
         -g 5 -keyint_min 5 -sc_threshold 0 \
@@ -599,6 +950,7 @@ _ffmpeg_record() {
         _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" "$stopflag" \
             ffmpeg \
             -rtsp_transport tcp \
+            ${FFMPEG_RTSP_TIMEOUT_ARGS[@]+"${FFMPEG_RTSP_TIMEOUT_ARGS[@]}"} \
             -i "$rtsp" \
             -t "$dur" \
             -c:v copy \
@@ -606,6 +958,36 @@ _ffmpeg_record() {
             -movflags +faststart \
             -y "$out"
     fi
+}
+
+# ---- Whole-second duration of a media file, 0 when unreadable ---------
+# Always echoes an integer: the value is passed to the API as a JSON number,
+# and ffprobe answers "N/A" for a file whose moov atom never got written.
+_probe_duration() {
+    local d; d=$(ffprobe -v error -show_entries format=duration \
+        -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | cut -d. -f1)
+    [[ "$d" =~ ^[0-9]+$ ]] || d=0
+    echo "$d"
+}
+
+# ---- Join capture parts into one mp4 ----------------------------------
+# Every part comes from the same camera through the same encoder settings, so a
+# stream copy through the concat demuxer is safe and near-instant. Returns
+# non-zero if the join fails, leaving the caller to fall back to a single part.
+_concat_parts() {
+    local out="$1"; shift
+    local list="${out%.mp4}.parts.txt" p rc
+    : > "$list" || return 1
+    for p in "$@"; do
+        # Single-quoted paths in the concat list; ' is not in the sanitized set
+        # these names are built from, but escape it rather than assume.
+        printf "file '%s'\n" "${p//\'/\'\\\'\'}" >> "$list"
+    done
+    ffmpeg -f concat -safe 0 -i "$list" -c copy -movflags +faststart -y "$out" \
+        >/dev/null 2>"${out}.err"
+    rc=$?
+    rm -f "$list"
+    [[ $rc -eq 0 && -s "$out" ]]
 }
 
 # ---- Upload first frame as thumbnail, echo blob URL or empty ----------
@@ -643,49 +1025,74 @@ _run_recording() {
 
     log "Recording $rec_id: starting (cam=$cam_name, site=$site_name, ${dur_sec}s)"
 
-    local min_dur=$(( dur_sec / 2 ))
-    local attempt=0 max_attempts=3 remaining="$dur_sec"
+    # A capture that ends early — dropped RTSP session, deadline, encoder that
+    # could not keep up — leaves a gap. Each attempt records only the part still
+    # missing into its own file, and the parts are joined at the end: what was
+    # already captured is never thrown away, and the total can actually reach
+    # the requested length instead of topping out at one attempt's worth.
+    local min_dur=$(( dur_sec * RECORDING_COMPLETE_PCT / 100 ))
+    local attempt=0 captured=0 last_err=""
+    local -a parts=()
 
-    while (( attempt < max_attempts && remaining > min_dur )); do
+    while (( attempt < RECORDING_MAX_ATTEMPTS && captured < min_dur )); do
         attempt=$(( attempt + 1 ))
-        _ffmpeg_record "$rtsp" "$rec_file" "$remaining" "$stopflag"
+        local remaining=$(( dur_sec - captured ))
+        local part; part=$(printf '%s/rec_%s_p%02d.mp4' "$TMP_DIR" "$rec_id" "$attempt")
+
+        _ffmpeg_record "$rtsp" "$part" "$remaining" "$stopflag"
+
+        if [[ -s "$part" ]]; then
+            local part_dur; part_dur=$(_probe_duration "$part")
+            parts+=("$part")
+            captured=$(( captured + part_dur ))
+        else
+            last_err=$(grep -v "^$" "${part}.err" 2>/dev/null | tail -5 | tr '\n' ' ')
+            rm -f "$part" "${part}.err"
+        fi
 
         # An explicit early-stop ends the recording now — keep whatever was
-        # captured and skip the short-recording retry logic below.
+        # captured and skip the resume logic below.
         if [[ -f "$stopflag" ]]; then
             log "Recording $rec_id: stopped on command — finalizing"
             break
         fi
 
-        if [[ ! -s "$rec_file" ]]; then
-            local ffmpeg_err
-            ffmpeg_err=$(grep -v "^$" "${rec_file}.err" 2>/dev/null | tail -5 | tr '\n' ' ')
-            log_error "Recording $rec_id: ffmpeg failed for camera '$cam_name' (${rtsp%%@*}) — ${ffmpeg_err:-no output}"
-            _api_update "$rec_id" "" "failed" "$start_time" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$dur_sec" "$cam_id"
-            rm -f "$rec_file" "${rec_file}.err"; rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
-            return
+        (( captured >= min_dur )) && break
+
+        if (( ${#parts[@]} == 0 )); then
+            log_error "Recording $rec_id: ffmpeg produced nothing for camera '$cam_name' (${rtsp%%@*}), attempt $attempt/$RECORDING_MAX_ATTEMPTS — ${last_err:-no output}"
+        else
+            log_warn "Recording $rec_id: captured ${captured}s of ${dur_sec}s after attempt $attempt/$RECORDING_MAX_ATTEMPTS — resuming for the remaining $(( dur_sec - captured ))s"
         fi
-
-        local actual_dur
-        actual_dur=$(ffprobe -v error -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 "$rec_file" 2>/dev/null | cut -d. -f1)
-        actual_dur=${actual_dur:-0}
-
-        if (( actual_dur >= min_dur )); then
-            break
-        fi
-
-        log_warn "Recording $rec_id: short recording (${actual_dur}s/${remaining}s), attempt $attempt/$max_attempts — retrying"
-        remaining=$(( remaining - actual_dur ))
-        rm -f "$rec_file" "${rec_file}.err"
-        sleep 5
+        (( attempt < RECORDING_MAX_ATTEMPTS )) && sleep 5
     done
+
+    # Nothing at all was captured across every attempt — report failed and bail.
+    if (( ${#parts[@]} == 0 )); then
+        log_error "Recording $rec_id: no video captured for camera '$cam_name' (${rtsp%%@*}) — ${last_err:-no output}"
+        _api_update "$rec_id" "" "failed" "$start_time" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "0" "$cam_id"
+        rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
+        return
+    fi
+
+    if (( ${#parts[@]} == 1 )); then
+        mv -f "${parts[0]}" "$rec_file"
+    elif ! _concat_parts "$rec_file" "${parts[@]}"; then
+        # Joining failed: ship the longest single part rather than nothing.
+        local best="${parts[0]}" best_dur=0 p p_dur
+        for p in "${parts[@]}"; do
+            p_dur=$(_probe_duration "$p")
+            (( p_dur > best_dur )) && { best="$p"; best_dur=$p_dur; }
+        done
+        log_warn "Recording $rec_id: could not join ${#parts[@]} parts — uploading the longest (${best_dur}s)"
+        mv -f "$best" "$rec_file"
+    fi
+    rm -f "${parts[@]}" "${parts[@]/%/.err}"
 
     local sz; sz=$(_file_size "$rec_file")
 
     # An early stop before any frames were captured leaves an empty file —
-    # nothing to upload. Report failed and bail (the normal full-duration path
-    # already handles empty output inside the retry loop above).
+    # nothing to upload.
     if [[ ! -s "$rec_file" ]]; then
         log_warn "Recording $rec_id: stopped with no captured video — nothing to upload"
         _api_update "$rec_id" "" "failed" "$start_time" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "0" "$cam_id"
@@ -693,44 +1100,95 @@ _run_recording() {
         return
     fi
 
-    log "Recording $rec_id: ffmpeg done (${sz}B), uploading..."
+    # Always report the length of the file we are actually shipping. Reporting
+    # the requested duration is what let a truncated capture reach the dashboard
+    # as a full-length recording, hiding the truncation from everyone.
+    local report_dur; report_dur=$(_probe_duration "$rec_file")
 
-    # Report the actual captured length when stopped early; otherwise the
-    # requested duration (matches prior behaviour for full-length recordings).
-    local report_dur="$dur_sec"
-    if [[ -f "$stopflag" ]]; then
-        local probe_dur
-        probe_dur=$(ffprobe -v error -show_entries format=duration \
-            -of default=noprint_wrappers=1:nokey=1 "$rec_file" 2>/dev/null | cut -d. -f1)
-        report_dur=${probe_dur:-0}
+    log "Recording $rec_id: ffmpeg done (${report_dur}s of ${dur_sec}s, ${sz}B), uploading..."
+
+    if [[ ! -f "$stopflag" ]] && (( report_dur < min_dur )); then
+        log_warn "Recording $rec_id: SHORT — captured ${report_dur}s of the requested ${dur_sec}s after $attempt attempt(s); uploading what there is"
     fi
 
+    local stop_time; stop_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     local url; url=$(_azure_upload "$rec_file" "$blob_path") || url=""
+
+    # Upload failed after every retry. Keep the footage and try again on a later
+    # poll rather than deleting it — the bytes are unrecoverable once dropped,
+    # and the usual cause (a bad uplink) fixes itself.
+    if [[ -z "$url" ]]; then
+        rm -f "${rec_file}.err"
+        if _spool_put "$rec_file" "$rec_id" "$cam_id" "$blob_path" "$thumb_path" \
+                      "$start_time" "$stop_time" "$report_dur"; then
+            rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
+            return
+        fi
+        log_error "Recording $rec_id: upload failed and could not be spooled — recording lost"
+        _api_update "$rec_id" "" "failed" "$start_time" "$stop_time" "$report_dur" "$cam_id"
+        rm -f "$rec_file"; rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
+        return
+    fi
+
     local thumb; thumb=$(_upload_thumb "$rec_file" "$thumb_path") || thumb=""
     rm -f "$rec_file" "${rec_file}.err"
 
-    local stop_time; stop_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-
-    if [[ -n "$url" ]]; then
-        _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$report_dur" "$cam_id"
-        log "Recording $rec_id: completed — $blob_path (${sz}B)"
-    else
-        _api_update "$rec_id" "" "failed" "$start_time" "$stop_time" "$report_dur" "$cam_id"
-        log_error "Recording $rec_id: upload failed"
-    fi
+    _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$report_dur" "$cam_id"
+    log "Recording $rec_id: completed — $blob_path (${sz}B)"
 
     rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"
+}
+
+# ---- Resolve a start payload's duration, in seconds --------------------
+# The field has carried three spellings: `duration_seconds` (Firebase push) and
+# `recording_duration` (poll) are seconds, while the macOS client's endpoint
+# sends `duration_minutes`. Read all three rather than letting a renamed field
+# fall through to the hour-long default, which silently turns every recording
+# into a 60-minute one. Echoes seconds on stdout; logs go to stderr.
+_duration_sec() {
+    local json="$1" rec_id="${2:-?}" field v
+
+    for field in duration_seconds recording_duration; do
+        v=$(echo "$json" | jq -r --arg f "$field" '.[$f] // empty' 2>/dev/null)
+        v="${v%%.*}"   # tolerate 1800.0
+        if [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )); then
+            # Every dashboard preset is minutes; a "seconds" value below 60 is
+            # almost certainly minutes that were never converted. Honour it as
+            # sent — but say so, because the recording will be seconds long.
+            (( v < 60 )) && log_warn "Recording $rec_id: ${field}=${v} is under a minute — if the dashboard asked for ${v} minutes, the sender is not converting to seconds"
+            echo "$v"; return
+        fi
+    done
+
+    v=$(echo "$json" | jq -r '.duration_minutes // empty' 2>/dev/null)
+    v="${v%%.*}"
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )); then
+        log "Recording $rec_id: duration taken from duration_minutes=${v} ($(( v * 60 ))s)"
+        echo $(( v * 60 )); return
+    fi
+
+    log_warn "Recording $rec_id: no usable duration field in payload (looked for duration_seconds, recording_duration, duration_minutes) — defaulting to ${RECORDING_DEFAULT_SEC}s"
+    echo "$RECORDING_DEFAULT_SEC"
 }
 
 # ---- Dispatch a single recording; atomic claim avoids double-start -----
 # Used by both the poll loop and the Firebase consumer (which run concurrently).
 # `mkdir` is the claim: it succeeds for exactly one caller per recording_id.
-# Returns 0 if dispatched, 1 if skipped (invalid or already active).
+# Returns 0 if dispatched, 1 if skipped (invalid, already active, or no disk).
 _dispatch_one() {
     local rec_id="$1" cam_id="$2" cam_name="$3" dur_sec="$4" rtsp="$5" site_name="${6:-}"
 
     if [[ -z "$rec_id" || -z "$rtsp" ]]; then
         log_warn "Skipping invalid recording (missing recording_id or camera_url): id='$rec_id'"
+        return 1
+    fi
+
+    # Starting a capture with no room to write it fills the disk and takes the
+    # logs and the spool down with it. Refuse early and say so.
+    local free_mb; free_mb=$(_free_mb "$TMP_DIR"); free_mb=${free_mb:-0}
+    if (( free_mb < MIN_FREE_MB )); then
+        log_error "Recording $rec_id: only ${free_mb}MB free on $TMP_DIR (need ${MIN_FREE_MB}MB) — refusing to start"
+        _api_update "$rec_id" "" "failed" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "0" "$cam_id"
         return 1
     fi
 
@@ -758,7 +1216,7 @@ _dispatch() {
         cam_name=$(echo "$rec"  | jq -r '.camera_name        // .camera_id // empty')
         site_name=$(echo "$rec" | jq -r '.site_name          // empty')
         rtsp=$(echo "$rec"      | jq -r '.camera_url         // empty')
-        dur_sec=$(echo "$rec"   | jq -r '.recording_duration // 3600')
+        dur_sec=$(_duration_sec "$rec" "${rec_id:-?}")
 
         _dispatch_one "$rec_id" "$cam_id" "$cam_name" "$dur_sec" "$rtsp" "$site_name" \
             && dispatched=$(( dispatched + 1 ))
@@ -956,7 +1414,7 @@ _firebase_loop() {
                     cam_id=$(echo "$line"   | jq -r '.camera_id        // empty' 2>/dev/null)
                     cam_name=$(echo "$line" | jq -r '.camera_name      // .camera_id // empty' 2>/dev/null)
                     rtsp=$(echo "$line"     | jq -r '.camera_url       // empty' 2>/dev/null)
-                    dur=$(echo "$line"      | jq -r '.duration_seconds // 3600' 2>/dev/null)
+                    dur=$(_duration_sec "$line" "$rec_id")
                     # Prefer the resolved site name; else a stable site-<id> folder.
                     local site_label="$CLIENT_SITE_NAME"
                     [[ -z "$site_label" && -n "$cmd_site" ]] && site_label="site-${cmd_site}"
@@ -984,6 +1442,11 @@ _firebase_loop() {
 # ---- Normalise GET response, then dispatch ----------------------------
 _poll() {
     log "Polling for pending recordings..."
+
+    mkdir -p "$TMP_DIR" "$ACTIVE_DIR" "$SPOOL_DIR" 2>/dev/null || true
+    _reap_stale_ffmpeg   # clear captures that outlived their recording
+    _spool_drain         # ship anything the network refused earlier
+
     local resp http_code tmp
     tmp=$(mktemp)
     http_code=$(curl -s -o "$tmp" -w "%{http_code}" --max-time 10 \
@@ -1038,8 +1501,46 @@ _poll() {
 }
 
 # ---- Main loop ---------------------------------------------------------
-_ensure_container
-log "Azure container ready (${AZURE_CONTAINER}/${AZURE_BLOB_PREFIX}/ ensured)"
+log "Work dir: $TMP_DIR (spool: $SPOOL_DIR, $(_free_mb "$TMP_DIR")MB free)"
+
+# Recordings spooled by an older build under /tmp are still worth shipping, and
+# /tmp is cleared on reboot — move them onto the state dir before that happens.
+if [[ "$TMP_DIR" != "$LEGACY_TMP_DIR" && -d "$LEGACY_TMP_DIR/spool" ]]; then
+    _migrated=$(find "$LEGACY_TMP_DIR/spool" -maxdepth 1 -type f -name '*.mp4' 2>/dev/null | wc -l)
+    if (( _migrated > 0 )); then
+        mv -f "$LEGACY_TMP_DIR"/spool/* "$SPOOL_DIR"/ 2>/dev/null \
+            && log "Migrated $_migrated spooled recording(s) from $LEGACY_TMP_DIR/spool" \
+            || log_warn "Could not migrate spooled recordings from $LEGACY_TMP_DIR/spool"
+    fi
+fi
+
+# Claim directories now survive a restart (the state dir is not wiped like /tmp
+# was), so any claim present at startup belongs to a dead generation. Clear them
+# first — otherwise they block every future dispatch of those recording ids —
+# then reap the ffmpeg those recordings left holding their RTSP sessions.
+_stale_claims=$(find "$ACTIVE_DIR" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+if (( _stale_claims > 0 )); then
+    log_warn "Clearing $_stale_claims claim(s) left by a previous daemon generation"
+    rm -rf "${ACTIVE_DIR:?}"/* 2>/dev/null || true
+fi
+_reap_stale_ffmpeg 0
+
+_detect_rtsp_timeout_flag
+log "ffmpeg RTSP timeout: ${FFMPEG_RTSP_TIMEOUT_ARGS[*]:-none}"
+
+_container_state=$(_ensure_container)
+_container_access="${_container_state#*:}"
+log "Azure container ready (${AZURE_CONTAINER}/${AZURE_BLOB_PREFIX}/, access=${_container_access:-unknown})"
+
+# Permanent URLs carry no token, so the object has to be readable without one.
+# Say so up front rather than letting the probe fail with no explanation.
+if [[ "$CDN_PUBLIC_URLS" == "1" && "$_container_access" == "private" ]]; then
+    log_warn "Container '${AZURE_CONTAINER}' is private but permanent CDN URLs are on — these resolve only if ${CDN_BASE_URL} authenticates to its origin. If the probe below fails, either set the container's public access to 'blob' or leave CDN_PUBLIC_URLS=0."
+fi
+
+# Confirm permanent CDN links actually resolve before any recording is written
+# with one; falls back to signed URLs if they don't.
+_probe_public_url
 
 # Resolve the site this token is scoped to (for Firebase scoping + labelling).
 _fetch_site_context

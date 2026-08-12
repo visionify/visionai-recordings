@@ -345,6 +345,45 @@ Recordings are optimised for computer vision — frame extraction and annotation
 
 Expected file size: **150–400 MB** per 30-minute recording.
 
+### Recording duration
+
+The requested duration is read from the start payload in this order:
+
+| Field | Unit | Sent by |
+|-------|------|---------|
+| `duration_seconds` | seconds | Firebase push commands |
+| `recording_duration` | seconds | `get-recording-status` poll response |
+| `duration_minutes` | minutes (×60 applied) | macOS client's endpoint |
+
+If none of them is present or usable, the daemon logs a warning and falls back
+to `RECORDING_DEFAULT_SEC`. It also warns when a seconds field holds a value
+under a minute, which usually means the sender passed minutes without
+converting. The duration the daemon actually resolved is on the dispatch line:
+
+```
+Recording <id>: dispatching (cam=..., site=..., 1800s)
+```
+
+Compare that against the duration picked in the dashboard — if they disagree,
+the problem is upstream of this script.
+
+### When a capture ends early
+
+A dropped RTSP session, a stalled camera, or an encoder that cannot keep up can
+end a capture before the requested duration. The daemon then records **only the
+part still missing** (up to `RECORDING_MAX_ATTEMPTS` attempts) and joins the
+pieces into one file — what was already captured is never discarded.
+
+The reported duration is always the length of the file that was actually
+uploaded, never the requested length, so a short recording is visible rather
+than silently reported as full-length. Check the log for:
+
+```
+Recording <id>: captured 900s of 1800s after attempt 1/3 — resuming for the remaining 900s
+Recording <id>: SHORT — captured 1200s of the requested 1800s after 3 attempt(s)
+ffmpeg deadline exceeded for ... — terminating     # encoder could not keep up
+```
+
 ### Optional Configuration (`.env`)
 
 | Variable | Default | Description |
@@ -352,12 +391,74 @@ Expected file size: **150–400 MB** per 30-minute recording.
 | `POLL_INTERVAL` | `300` | Seconds between API polls |
 | `UPLOAD_RETRIES` | `3` | Max Azure upload attempts |
 | `UPLOAD_RETRY_DELAY` | `10` | Seconds between upload retries |
+| `RECORDING_COMPLETE_PCT` | `95` | Share of the requested duration a capture must cover to count as complete |
+| `RECORDING_MAX_ATTEMPTS` | `3` | Capture attempts per recording — each one records only the part still missing |
+| `RECORDING_DEFAULT_SEC` | `3600` | Fallback only, used when a start payload carries no recognizable duration field |
+| `FFMPEG_RW_TIMEOUT_US` | `15000000` | ffmpeg RTSP socket timeout (µs). Bounds a camera that accepts the connection then stops sending |
+| `FFMPEG_TERM_GRACE` | `10` | Seconds ffmpeg gets to finalize on SIGTERM before SIGKILL |
+| `WORK_DIR` | `/var/lib/visionai/rec` | Captures and upload spool. Deliberately not under `/tmp` |
+| `SPOOL_MAX_AGE_HOURS` | `72` | Spooled recordings older than this are dropped |
+| `SPOOL_MAX_MB` | `20000` | Spool size ceiling; oldest dropped first when exceeded |
+| `MIN_FREE_MB` | `2000` | Refuse to start a capture below this much free disk |
+| `CDN_BASE_URL` | falls back to `AZURE_CDN_BASE_URL` | CDN / Front Door host for permanent URLs |
+| `CDN_PUBLIC_URLS` | `1` when a CDN host is set, else `0` | `1` = permanent unsigned CDN URL; `0` = expiring signed URL |
+| `AZURE_CDN_INCLUDE_CONTAINER` | `0` | Whether the container name belongs in the CDN path — verified at startup, corrected if wrong |
+| `AZURE_SAS_EXPIRY_DAYS` | `7` | Signed-URL lifetime when not using CDN URLs |
 | `PYTHON_BIN` | auto-detected | Path to Python 3 with azure-storage-blob |
 | `DEBUG` | `0` | Set to `1` for verbose logging |
 | `FIREBASE_DATABASE_URL` | _unset_ | Realtime DB URL — **set this to enable Firebase push** |
 | `FIREBASE_SERVICE_ACCOUNT` | _unset_ | Path to a service-account JSON (alternative to the fields below) |
 | `FIREBASE_PROJECT_ID` … | _unset_ | Service-account fields (same as the backend): `FIREBASE_PRIVATE_KEY_ID`, `FIREBASE_PRIVATE_KEY`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_CLIENT_ID`, `FIREBASE_CLIENT_X509_CERT_URL` |
 | `FIREBASE_RESTART_DELAY` | `15` | Seconds before restarting the listener if it exits |
+
+### Media URLs on Linux: permanent CDN links
+
+Same behaviour as the macOS manager. Set the CDN host and the manager returns a
+permanent URL with no SAS token, instead of one that expires and leaves a dead
+link stored against the recording:
+
+```bash
+AZURE_CDN_BASE_URL=https://<your-cdn-host>
+```
+
+`CDN_PUBLIC_URLS` then defaults to `1`. On startup the manager uploads a small
+probe blob, tries the CDN path both with and without the container name, keeps
+whichever returns HTTP 200, and logs a correction if `AZURE_CDN_INCLUDE_CONTAINER`
+was wrong. If neither shape resolves it falls back to signed URLs rather than
+emitting links that 404:
+
+```
+CDN probe OK — permanent URLs resolve (HTTP 200, container-in-path=0)
+CDN probe failed (last HTTP 404) — permanent URLs would not resolve, falling back to signed URLs
+```
+
+Blobs are uploaded as `video/mp4` / `image/jpeg` with `Content-Disposition: inline`,
+so the URL plays in a browser instead of downloading. Clips uploaded before this
+change still carry `application/octet-stream` — see `scripts/backfill_content_type.py`.
+
+### Work directory and the upload spool (Linux)
+
+Captures and the spool live under `WORK_DIR` (`/var/lib/visionai/rec`), created
+by systemd via `StateDirectory=`. This is deliberately **not** `/tmp`: systemd
+clears `/tmp` at boot and prunes it on a timer, and on recent Ubuntu `/tmp` is
+tmpfs — so a recording waiting out a network outage would sit in RAM and be
+deleted by a reboot.
+
+When an upload exhausts its retries the footage is spooled with a sidecar
+describing where it was headed, and retried on later polls:
+
+```
+Recording 148: upload failed — spooled 41231884B for retry
+Spool: retrying upload for recording 148
+Recording 148: completed from spool — raw-recordings/<site>/cam-1.mp4
+```
+
+The spool is bounded by `SPOOL_MAX_AGE_HOURS` and `SPOOL_MAX_MB` (oldest dropped
+first), so a permanently broken uplink cannot fill the disk. Anything spooled by
+an older build under `/tmp/visionai-rec/spool` is migrated on startup.
+
+> When uninstalling, check `/var/lib/visionai/rec/spool` is empty first —
+> removing it discards recordings that never reached the cloud.
 
 ### Firebase push (optional — near-instant start/stop)
 
