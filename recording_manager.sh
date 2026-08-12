@@ -231,7 +231,22 @@ _find_python() {
             _candidates+=("$_home/$_rel")
         done
     done
-    _candidates+=(/opt/visionai/.venv/bin/python3 python3 python)
+    # Absolute interpreter paths BEFORE the bare PATH-resolved names.
+    #
+    # Relying on `python3` from PATH is a trap on these boxes: the daemon's PATH
+    # starts with /opt/homebrew/bin, so once Homebrew Python is installed it
+    # shadows /usr/bin/python3 — and the SDK is installed for the system Python,
+    # not Homebrew's. One site ran fine for weeks and then failed every upload
+    # the first time the daemon restarted after a brew install, with nothing in
+    # the recording manager itself having changed. Naming the paths explicitly
+    # means discovery no longer depends on PATH order.
+    _candidates+=(
+        /opt/visionai/.venv/bin/python3
+        /usr/bin/python3
+        /usr/local/bin/python3
+        /opt/homebrew/bin/python3
+        python3 python
+    )
 
     local _py
     for _py in "${_candidates[@]}"; do
