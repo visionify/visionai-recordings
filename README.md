@@ -419,7 +419,7 @@ ffmpeg deadline exceeded for ... — terminating     # encoder could not keep up
 | `MIN_FREE_MB` | `2000` | Refuse to start a capture below this much free disk |
 | `CDN_BASE_URL` | falls back to `AZURE_CDN_BASE_URL` | CDN / Front Door host for permanent URLs |
 | `CDN_PUBLIC_URLS` | `1` when a CDN host is set, else `0` | `1` = permanent unsigned CDN URL; `0` = expiring signed URL |
-| `AZURE_CDN_INCLUDE_CONTAINER` | `0` | Whether the container name belongs in the CDN path — verified at startup, corrected if wrong |
+| `AZURE_CDN_INCLUDE_CONTAINER` | `1` | Whether the container name belongs in the CDN path — verified at startup, corrected if wrong |
 | `AZURE_SAS_EXPIRY_DAYS` | `7` | Signed-URL lifetime when not using CDN URLs |
 | `PYTHON_BIN` | auto-detected | Path to Python 3 with azure-storage-blob |
 | `DEBUG` | `0` | Set to `1` for verbose logging |

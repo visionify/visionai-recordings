@@ -401,7 +401,13 @@ _check_vars
 # That is only safe where the CDN (or a public-read container) is what governs
 # access; set CDN_PUBLIC_URLS=0 to keep expiry.
 CDN_BASE_URL=${CDN_BASE_URL:-${AZURE_CDN_BASE_URL:-}}
-AZURE_CDN_INCLUDE_CONTAINER=${AZURE_CDN_INCLUDE_CONTAINER:-0}
+# Default 1: the CDN endpoint these devices use has the storage *account* root
+# as its origin, not a single container — a request to the endpoint root comes
+# back with the blob service's list-containers error rather than a container
+# response, which is only possible when no container is baked into the origin
+# path. URLs therefore need /<container>/<blob>. Still verified at startup and
+# corrected if a deployment is wired the other way.
+AZURE_CDN_INCLUDE_CONTAINER=${AZURE_CDN_INCLUDE_CONTAINER:-1}
 AZURE_SAS_EXPIRY_DAYS=${AZURE_SAS_EXPIRY_DAYS:-7}
 if [[ -n "$CDN_BASE_URL" ]]; then
     CDN_PUBLIC_URLS=${CDN_PUBLIC_URLS:-1}
@@ -836,8 +842,12 @@ _probe_public_url() {
     rm -f "$probe"
 
     local host; host=$(echo "$CDN_BASE_URL" | sed -E 's|^[a-z]+://||; s|/$||')
+    # Configured shape first, then the other one — there are only two, and any
+    # value that is not "1" is treated as 0 below, so this covers both whatever
+    # was configured. Listing them explicitly would retry the configured shape.
+    local other; [[ "$AZURE_CDN_INCLUDE_CONTAINER" == "1" ]] && other=0 || other=1
     local shape code=""
-    for shape in "$AZURE_CDN_INCLUDE_CONTAINER" 1 0; do
+    for shape in "$AZURE_CDN_INCLUDE_CONTAINER" "$other"; do
         if [[ "$shape" == "1" ]]; then
             code=$(curl -sI -o /dev/null -w "%{http_code}" --max-time 20 "https://${host}/${AZURE_CONTAINER}/${key}" 2>/dev/null)
         else
