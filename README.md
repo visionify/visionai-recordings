@@ -101,8 +101,6 @@ recordings/<camera>/<camera>-<YYYYMMDD-HHMMSS>-001.mp4
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `POLL_INTERVAL` | `300` | Seconds between API polls |
-| `VISIONAI_API_VERSION` | `auto` | `auto` probes for v1/v2; set `v1`/`v2` to skip the probe |
-| `CAMERA_MAP_TTL` | `300` | v2 only: seconds to cache the camera_id → RTSP map |
 | `SEGMENT_DURATION` | `600` | Seconds per video segment |
 | `UPLOAD_RETRIES` | `3` | Max upload attempts per segment before it is spooled |
 | `UPLOAD_RETRY_DELAY` | `10` | Base seconds between upload retries — doubles each attempt |
@@ -457,6 +455,8 @@ ffmpeg deadline exceeded for ... — terminating     # encoder could not keep up
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `POLL_INTERVAL` | `300` | Seconds between API polls |
+| `VISIONAI_API_VERSION` | `auto` | `auto` probes for v1/v2; set `v1`/`v2` to skip the probe |
+| `CAMERA_MAP_TTL` | `300` | v2 only: seconds to cache the camera_id → RTSP map |
 | `UPLOAD_RETRIES` | `3` | Max Azure upload attempts |
 | `UPLOAD_RETRY_DELAY` | `10` | Seconds between upload retries |
 | `RECORDING_COMPLETE_PCT` | `95` | Share of the requested duration a capture must cover to count as complete |
