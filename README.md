@@ -101,6 +101,8 @@ recordings/<camera>/<camera>-<YYYYMMDD-HHMMSS>-001.mp4
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `POLL_INTERVAL` | `300` | Seconds between API polls |
+| `VISIONAI_API_VERSION` | `auto` | `auto` probes for v1/v2; set `v1`/`v2` to skip the probe |
+| `CAMERA_MAP_TTL` | `300` | v2 only: seconds to cache the camera_id → RTSP map |
 | `SEGMENT_DURATION` | `600` | Seconds per video segment |
 | `UPLOAD_RETRIES` | `3` | Max upload attempts per segment before it is spooled |
 | `UPLOAD_RETRY_DELAY` | `10` | Base seconds between upload retries — doubles each attempt |
@@ -344,6 +346,36 @@ Recordings are optimised for computer vision — frame extraction and annotation
 | Audio | none | Not needed for CV |
 
 Expected file size: **150–400 MB** per 30-minute recording.
+
+### Backend version (v1 dashboard or v2 app)
+
+The manager speaks both. `VISIONAI_API_VERSION` defaults to `auto`, which probes
+once at startup — `/recordings/poll` answers on v2, `/v2/get-recording-status`
+on v1 — and logs what it found:
+
+```
+API version: v2 (detected — /recordings/poll answered)
+```
+
+Set it to `v1` or `v2` explicitly to skip the probe. Pointing a device at the
+wrong host fails as a plain 404 that looks like an outage, so the probe is worth
+the one extra request per start.
+
+| | v1 dashboard | v2 app |
+|---|---|---|
+| Poll | `GET /v2/get-recording-status?recording_type=raw` | `GET /recordings/poll` |
+| Complete | `POST /v2/update-recording-url` (id in body) | `POST /recordings/<id>/complete` |
+| Token context | `GET /v2/token-context` | `GET /token-context` (site_uuid only) |
+| Camera RTSP | in the poll response | `GET /v2/inference/cameras`, cached `CAMERA_MAP_TTL` |
+| Stop signal | recording absent for 2 polls | row reported with `status: "stopped"` |
+
+Firebase push is identical on both — same `recording-commands/<site_uuid>/<id>`
+path and the same command fields — so the listener needs no version handling.
+
+Two v2 differences worth knowing: the poll repeats every `started` recording on
+every cycle (the local claim directory, not the API, prevents a double
+dispatch), and it carries no `camera_url`, so the RTSP address is resolved per
+camera and cached.
 
 ### Recording duration
 

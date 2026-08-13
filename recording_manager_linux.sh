@@ -349,6 +349,18 @@ DURATION_MAX_AGE_HOURS=${DURATION_MAX_AGE_HOURS:-24}
 FFMPEG_RW_TIMEOUT_US=${FFMPEG_RW_TIMEOUT_US:-15000000}
 # Seconds to let ffmpeg finalize on SIGTERM before escalating to SIGKILL.
 FFMPEG_TERM_GRACE=${FFMPEG_TERM_GRACE:-10}
+# Which backend this site runs. The v1 dashboard and the v2 app expose the same
+# capabilities under different routes; "auto" probes for it at startup, which is
+# what a mixed fleet needs. Set explicitly to skip the probe.
+#   v1: GET /v2/get-recording-status        POST /v2/update-recording-url
+#   v2: GET /recordings/poll                POST /recordings/<id>/complete
+VISIONAI_API_VERSION=${VISIONAI_API_VERSION:-auto}
+API_VERSION=""            # resolved at startup
+# v2's poll reports camera_id but not camera_url, so the RTSP address is looked
+# up from /v2/inference/cameras and cached for this long.
+CAMERA_MAP_TTL=${CAMERA_MAP_TTL:-300}
+CAMERA_MAP_JSON=""
+CAMERA_MAP_AT=0
 # Azure Blob layout: <container>/<prefix>/<site_uuid>/<camera>-<timestamp>.mp4
 AZURE_CONTAINER=${AZURE_CONTAINER:-recordings}
 AZURE_BLOB_PREFIX=${AZURE_BLOB_PREFIX:-raw-recordings}
@@ -563,7 +575,9 @@ _api_update() {
         --argjson cid   "$camera_id" \
         '{recording_id:$rid,azure_url:$url,blob_path:$bp,status:$st,
           start_time:$start,stop_time:$stop,duration:$dur,camera_id:$cid}')
-    resp=$(_api_post "${VISIONAI_API_ENDPOINT}/v2/update-recording-url" "$body" 2>/dev/null) || true
+    local url="${VISIONAI_API_ENDPOINT}/v2/update-recording-url"
+    [[ "$API_VERSION" == "v2" ]] && url="${VISIONAI_API_ENDPOINT}/recordings/${recording_id}/complete"
+    resp=$(_api_post "$url" "$body" 2>/dev/null) || true
     log_debug "Recording $recording_id: _api_update status=$status resp=${resp:0:120}"
 }
 
@@ -579,15 +593,77 @@ _api_update() {
 # (listener scope), site_name (Azure folder label) and site_id (safety filter).
 # .env values may override any of these; without a uuid the listener falls back
 # to the unscoped root path and relies on the site_id filter.
+# ---- Which backend are we talking to? -----------------------------------
+# Probe rather than assume: the fleet runs both, and pointing a v1 client at the
+# v2 app (or the reverse) fails as a plain 404 that looks like an outage. v2's
+# poll answers 200 with a data array even when nothing is pending; v1's answers
+# 404 "No active recordings found", so an empty queue is not mistaken for the
+# wrong backend either way.
+_detect_api_version() {
+    if [[ "$VISIONAI_API_VERSION" != "auto" ]]; then
+        API_VERSION="$VISIONAI_API_VERSION"
+        log "API version: $API_VERSION (configured)"
+        return
+    fi
+
+    local body
+    body=$(_api_get "${VISIONAI_API_ENDPOINT}/recordings/poll" 10 2>/dev/null) || body=""
+    if [[ -n "$body" ]] && echo "$body" | jq -e 'has("data") and (.data | type == "array")' >/dev/null 2>&1; then
+        API_VERSION="v2"
+        log "API version: v2 (detected — /recordings/poll answered)"
+        return
+    fi
+
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+        -H "Token: $VISIONAI_API_TOKEN" \
+        "${VISIONAI_API_ENDPOINT}/v2/get-recording-status?recording_type=raw" 2>/dev/null)
+    if [[ "$code" == "200" || "$code" == "404" ]]; then
+        API_VERSION="v1"
+        log "API version: v1 (detected — /v2/get-recording-status answered HTTP $code)"
+        return
+    fi
+
+    API_VERSION="v1"
+    log_error "Could not determine API version (v2 poll silent, v1 status HTTP ${code:-000}) — assuming v1. Set VISIONAI_API_VERSION to override."
+}
+
+# ---- camera_id -> rtsp, for v2 ------------------------------------------
+# v2's recording poll carries camera_id but not camera_url; the address comes
+# from the same endpoint the inference service already uses. Cached because the
+# poll runs every POLL_INTERVAL and cameras change rarely.
+_camera_url_for() {
+    local cam_id="$1" now
+    now=$(date +%s)
+    if [[ -z "$CAMERA_MAP_JSON" ]] || (( now - CAMERA_MAP_AT > CAMERA_MAP_TTL )); then
+        local resp
+        resp=$(_api_get "${VISIONAI_API_ENDPOINT}/v2/inference/cameras" 15 2>/dev/null) || resp=""
+        if [[ -n "$resp" ]] && echo "$resp" | jq -e '.data | type == "array"' >/dev/null 2>&1; then
+            CAMERA_MAP_JSON=$(echo "$resp" | jq -c '[.data[] | {id, rtsp}]' 2>/dev/null)
+            CAMERA_MAP_AT=$now
+        else
+            log_warn "Could not refresh the camera list — recordings may be missing their RTSP address"
+        fi
+    fi
+    [[ -z "$CAMERA_MAP_JSON" ]] && { echo ""; return; }
+    echo "$CAMERA_MAP_JSON" | jq -r --argjson cid "$cam_id" \
+        'map(select(.id == $cid)) | .[0].rtsp // empty' 2>/dev/null
+}
+
 _fetch_site_context() {
-    local resp
-    resp=$(_api_get "${VISIONAI_API_ENDPOINT}/v2/token-context" 10 2>/dev/null) || resp=""
+    local resp path
+    # v2 serves the same payload unprefixed; it returns only site_uuid, which is
+    # all that is strictly needed (it scopes the Firebase listener and the blob
+    # layout). site_id/site_name stay empty there and are only used for labels.
+    path="/v2/token-context"
+    [[ "$API_VERSION" == "v2" ]] && path="/token-context"
+    resp=$(_api_get "${VISIONAI_API_ENDPOINT}${path}" 10 2>/dev/null) || resp=""
     if [[ -n "$resp" ]]; then
         CLIENT_SITE_ID=$(echo "$resp"   | jq -r '.site_id   // empty' 2>/dev/null)
         CLIENT_SITE_NAME=$(echo "$resp" | jq -r '.site_name // empty' 2>/dev/null)
         CLIENT_SITE_UUID=$(echo "$resp" | jq -r '.site_uuid // empty' 2>/dev/null)
     else
-        log_warn "/v2/token-context unavailable — check VISIONAI_API_ENDPOINT/TOKEN"
+        log_warn "${path} unavailable — check VISIONAI_API_ENDPOINT/TOKEN"
     fi
 
     # Optional .env overrides (API is normally the source of truth).
@@ -1339,6 +1415,7 @@ _dispatch() {
 # isn't yet reported active (the in_progress claim clears the camera flag).
 # $1 = newline-separated recording_ids the server currently reports active.
 _poll_stop_check() {
+    [[ "$API_VERSION" == "v2" ]] && return 0       # v2 reports stops explicitly
     [[ "$FIREBASE_ENABLED" == "1" ]] && return 0   # push path owns stop
     local active_ids="$1"
     local now; now=$(date +%s)
@@ -1547,6 +1624,82 @@ _firebase_loop() {
     done
 }
 
+# ---- v2 poll ------------------------------------------------------------
+# Shape differences from v1 that matter here:
+#   * one row per recording with an explicit status, not a queue of pending work
+#   * "started" rows repeat on every poll so a restarted daemon can resync — the
+#     claim directory, not the API, is what stops a double dispatch
+#   * "stopped" rows are how a stop reaches a device that missed the Firebase
+#     push, and they are reported for a bounded window afterwards
+#   * no camera_url; the RTSP address is looked up per camera_id
+_poll_v2() {
+    local resp http_code tmp
+    tmp=$(mktemp)
+    http_code=$(curl -s -o "$tmp" -w "%{http_code}" --max-time 10 \
+        -H "Content-Type: application/json" \
+        -H "Token: $VISIONAI_API_TOKEN" \
+        "${VISIONAI_API_ENDPOINT}/recordings/poll")
+    resp=$(cat "$tmp"); rm -f "$tmp"
+
+    if [[ "$http_code" == "000" ]]; then
+        log_error "API unreachable (HTTP 000) — check VISIONAI_API_ENDPOINT and network — retry in ${POLL_INTERVAL}s"
+        return
+    fi
+    if [[ "$http_code" != "200" ]]; then
+        log_error "API error (HTTP $http_code): ${resp:0:200} — retry in ${POLL_INTERVAL}s"
+        return
+    fi
+
+    local rows
+    rows=$(echo "$resp" | jq -c '[.data[]? | select((.recording_type // "raw") == "raw")]' 2>/dev/null) || rows="[]"
+    local n; n=$(echo "$rows" | jq 'length' 2>/dev/null); n=${n:-0}
+
+    # Stops first: a recording that ended should not be re-dispatched below.
+    local stopped_ids
+    stopped_ids=$(echo "$rows" | jq -r '.[] | select(.status == "stopped") | .recording_id' 2>/dev/null)
+    local rid
+    for rid in $stopped_ids; do
+        if [[ -d "${ACTIVE_DIR}/${rid}" ]]; then
+            log "Recording $rid: server reports stopped — finalizing"
+            touch "${ACTIVE_DIR}/${rid}.stop"
+        fi
+    done
+
+    local started
+    started=$(echo "$rows" | jq -c '[.[] | select(.status == "started")]' 2>/dev/null) || started="[]"
+    local started_n; started_n=$(echo "$started" | jq 'length' 2>/dev/null); started_n=${started_n:-0}
+
+    if (( started_n == 0 )); then
+        log "No pending recordings"
+        return
+    fi
+    log "Found $started_n active recording(s)"
+
+    local i
+    for i in $(seq 0 $(( started_n - 1 ))); do
+        local rec rec_id cam_id cam_name rtsp dur_sec
+        rec=$(echo "$started" | jq -c ".[$i]")
+        rec_id=$(echo "$rec"   | jq -r '.recording_id // empty')
+        cam_id=$(echo "$rec"   | jq -r '.camera_id    // empty')
+        cam_name=$(echo "$rec" | jq -r '.camera_name  // .camera_id // empty')
+        [[ -z "$rec_id" ]] && continue
+
+        # Already ours — skip before spending a camera lookup on it.
+        [[ -d "${ACTIVE_DIR}/${rec_id}" ]] && { log_debug "Recording $rec_id: already active — skip"; continue; }
+
+        dur_sec=$(_duration_sec "$rec" "$rec_id")
+        dur_sec=$(_duration_preferred "$rec_id" "$dur_sec")
+
+        rtsp=$(_camera_url_for "$cam_id")
+        if [[ -z "$rtsp" ]]; then
+            log_error "Recording $rec_id: no RTSP address for camera $cam_id — cannot record"
+            continue
+        fi
+
+        _dispatch_one "$rec_id" "$cam_id" "$cam_name" "$dur_sec" "$rtsp" "${CLIENT_SITE_NAME:-}" || true
+    done
+}
+
 # ---- Normalise GET response, then dispatch ----------------------------
 _poll() {
     log "Polling for pending recordings..."
@@ -1555,6 +1708,11 @@ _poll() {
     _reap_stale_ffmpeg   # clear captures that outlived their recording
     _spool_drain         # ship anything the network refused earlier
     _duration_prune      # forget durations from long-finished recordings
+
+    if [[ "$API_VERSION" == "v2" ]]; then
+        _poll_v2
+        return
+    fi
 
     local resp http_code tmp
     tmp=$(mktemp)
@@ -1650,6 +1808,9 @@ fi
 # Confirm permanent CDN links actually resolve before any recording is written
 # with one; falls back to signed URLs if they don't.
 _probe_public_url
+
+# Which backend this site runs — decides every REST path below.
+_detect_api_version
 
 # Resolve the site this token is scoped to (for Firebase scoping + labelling).
 _fetch_site_context
