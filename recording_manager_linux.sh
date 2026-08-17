@@ -349,6 +349,32 @@ DURATION_MAX_AGE_HOURS=${DURATION_MAX_AGE_HOURS:-24}
 FFMPEG_RW_TIMEOUT_US=${FFMPEG_RW_TIMEOUT_US:-15000000}
 # Seconds to let ffmpeg finalize on SIGTERM before escalating to SIGKILL.
 FFMPEG_TERM_GRACE=${FFMPEG_TERM_GRACE:-10}
+# ---- Capture quality --------------------------------------------------
+# One hardcoded profile cannot fit a fleet of mixed edge devices: what keeps a
+# box with a GPU smooth will starve a weak CPU-only unit, and what that unit can
+# sustain is needlessly coarse everywhere else. These defaults suit a mid-range
+# device; override per device in the env file.
+#
+# 10 fps at 800k is ~0.09 bits/pixel at 720p. The previous 5 fps was chosen for
+# frame extraction, where it is fine, but a person walking moves ~30cm between
+# frames at that rate, so anyone *watching* the clip sees a slideshow.
+RECORD_FPS=${RECORD_FPS:-10}
+RECORD_MAXRATE=${RECORD_MAXRATE:-800k}
+RECORD_CRF=${RECORD_CRF:-26}
+RECORD_BUFSIZE=${RECORD_BUFSIZE:-}      # empty: derived as 2x maxrate at startup
+# Keyframe interval in seconds. Frame extraction decodes sequentially, so a
+# tight GOP buys CV nothing and spends the bitrate on redundant I-frames.
+RECORD_GOP_SEC=${RECORD_GOP_SEC:-5}
+# Software x264 preset. Slower presets track motion far better — blur on a
+# moving person is mostly weak motion estimation, not a shortage of bits — but
+# `medium` once could not sustain the input rate here and captures were cut in
+# half (88dcb88). Only raise this on a device where you have measured it.
+RECORD_X264_PRESET=${RECORD_X264_PRESET:-veryfast}
+# auto | nvenc | vaapi | software. "auto" functionally probes each at startup:
+# an encoder can be compiled into ffmpeg and still fail for want of a driver,
+# a device node, or permissions, so presence in -encoders proves nothing.
+RECORD_ENCODER=${RECORD_ENCODER:-auto}
+RECORD_VAAPI_DEVICE=${RECORD_VAAPI_DEVICE:-}   # empty: first /dev/dri/renderD*
 # Which backend this site runs. The v1 dashboard and the v2 app expose the same
 # capabilities under different routes; "auto" probes for it at startup, which is
 # what a mixed fleet needs. Set explicitly to skip the probe.
@@ -982,6 +1008,107 @@ _detect_rtsp_timeout_flag() {
     fi
 }
 
+# ---- Pick a video encoder for this device -----------------------------
+# Populates VIDEO_GLOBAL_ARGS / VIDEO_FILTER / VIDEO_ENCODER_ARGS, which
+# _ffmpeg_record splices into both the transcode command and its probe.
+#
+# Hardware encoding is what lets a mixed fleet raise frame rate and motion
+# quality at the same time. On software x264 the two trade against each other:
+# the preset that tracks a moving person properly is the one that could not keep
+# up with the input rate, and a capture that falls behind gets cut off by the
+# deadline. Offloading to a GPU removes the CPU ceiling from that equation.
+VIDEO_GLOBAL_ARGS=()
+VIDEO_FILTER=""
+VIDEO_ENCODER_ARGS=()
+VIDEO_ENCODER_NAME=""
+
+# Scale to at most 720p without ever upscaling a smaller camera stream.
+_SCALE_CHAIN="scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease:force_divisible_by=2"
+
+# Does this ffmpeg actually produce output with these args? Encodes a handful of
+# synthetic frames to /dev/null; no camera and no network involved. Args before
+# `--` are ffmpeg globals, after it the encoder flags.
+_encoder_works() {
+    local filter="$1"; shift
+    local -a globals=() enc=()
+    while [[ "$1" != "--" ]]; do globals+=("$1"); shift; done
+    shift
+    enc=("$@")
+    ffmpeg -hide_banner -loglevel error \
+        ${globals[@]+"${globals[@]}"} \
+        -f lavfi -i "testsrc=size=640x480:rate=5" -frames:v 5 \
+        -vf "$filter" "${enc[@]}" -f null - >/dev/null 2>&1
+}
+
+_detect_video_encoder() {
+    # bufsize defaults to a 2s VBV window at the chosen ceiling.
+    if [[ -z "$RECORD_BUFSIZE" ]]; then
+        local n="${RECORD_MAXRATE%[kKmM]}" unit="${RECORD_MAXRATE##*[0-9]}"
+        if [[ "$n" =~ ^[0-9]+$ ]]; then
+            RECORD_BUFSIZE="$(( n * 2 ))${unit}"
+        else
+            RECORD_BUFSIZE="$RECORD_MAXRATE"
+            log_warn "Cannot parse RECORD_MAXRATE=$RECORD_MAXRATE — using it verbatim as bufsize"
+        fi
+    fi
+
+    local gop=$(( RECORD_FPS * RECORD_GOP_SEC ))
+    (( gop < 1 )) && gop=1
+
+    local want="$RECORD_ENCODER"
+
+    # --- NVIDIA NVENC ---
+    if [[ "$want" == "auto" || "$want" == "nvenc" ]]; then
+        local -a nv=(-c:v h264_nvenc -rc vbr -cq "$RECORD_CRF"
+                     -maxrate "$RECORD_MAXRATE" -bufsize "$RECORD_BUFSIZE"
+                     -profile:v high -pix_fmt yuv420p
+                     -g "$gop" -keyint_min "$gop")
+        if _encoder_works "${_SCALE_CHAIN},format=yuv420p" -- "${nv[@]}"; then
+            VIDEO_GLOBAL_ARGS=()
+            VIDEO_FILTER="${_SCALE_CHAIN},format=yuv420p"
+            VIDEO_ENCODER_ARGS=("${nv[@]}")
+            VIDEO_ENCODER_NAME="h264_nvenc"
+            return
+        fi
+        [[ "$want" == "nvenc" ]] && log_warn "RECORD_ENCODER=nvenc but h264_nvenc does not work here — falling back"
+    fi
+
+    # --- VAAPI (Intel/AMD iGPU) ---
+    if [[ "$want" == "auto" || "$want" == "vaapi" ]]; then
+        local dev="$RECORD_VAAPI_DEVICE"
+        if [[ -z "$dev" ]]; then
+            for d in /dev/dri/renderD*; do [[ -e "$d" ]] && { dev="$d"; break; }; done
+        fi
+        if [[ -n "$dev" && -e "$dev" ]]; then
+            # VAAPI has no CRF; drive it in VBR with a target under the ceiling.
+            local target="$RECORD_MAXRATE"
+            local tn="${RECORD_MAXRATE%[kKmM]}" tu="${RECORD_MAXRATE##*[0-9]}"
+            [[ "$tn" =~ ^[0-9]+$ ]] && target="$(( tn * 6 / 10 ))${tu}"
+            local -a va=(-c:v h264_vaapi -rc_mode VBR -b:v "$target"
+                         -maxrate "$RECORD_MAXRATE" -bufsize "$RECORD_BUFSIZE"
+                         -profile:v high -g "$gop" -keyint_min "$gop")
+            local vf="${_SCALE_CHAIN},format=nv12,hwupload"
+            if _encoder_works "$vf" -vaapi_device "$dev" -- "${va[@]}"; then
+                VIDEO_GLOBAL_ARGS=(-vaapi_device "$dev")
+                VIDEO_FILTER="$vf"
+                VIDEO_ENCODER_ARGS=("${va[@]}")
+                VIDEO_ENCODER_NAME="h264_vaapi ($dev)"
+                return
+            fi
+        fi
+        [[ "$want" == "vaapi" ]] && log_warn "RECORD_ENCODER=vaapi but h264_vaapi does not work here — falling back"
+    fi
+
+    # --- Software x264 (always available) ---
+    VIDEO_GLOBAL_ARGS=()
+    VIDEO_FILTER="${_SCALE_CHAIN},format=yuv420p"
+    VIDEO_ENCODER_ARGS=(-c:v libx264 -preset "$RECORD_X264_PRESET" -crf "$RECORD_CRF"
+                        -maxrate "$RECORD_MAXRATE" -bufsize "$RECORD_BUFSIZE"
+                        -profile:v high -pix_fmt yuv420p
+                        -g "$gop" -keyint_min "$gop" -sc_threshold 0)
+    VIDEO_ENCODER_NAME="libx264 ($RECORD_X264_PRESET)"
+}
+
 # ---- Stop an ffmpeg child, escalating if it ignores SIGTERM ------------
 # SIGTERM first so ffmpeg finalizes the moov atom (+faststart leaves a playable
 # partial). An ffmpeg blocked in a stalled RTSP read ignores TERM, and the old
@@ -1040,16 +1167,14 @@ _ffmpeg_record() {
     # preset has to leave headroom on modest hardware.
     _ffmpeg_run "$out" "$dur" "$errfile" "$deadline" "$stopflag" \
         ffmpeg \
+        ${VIDEO_GLOBAL_ARGS[@]+"${VIDEO_GLOBAL_ARGS[@]}"} \
         -rtsp_transport tcp \
         ${FFMPEG_RTSP_TIMEOUT_ARGS[@]+"${FFMPEG_RTSP_TIMEOUT_ARGS[@]}"} \
         -i "$rtsp" \
         -t "$dur" \
-        -vf "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p" \
-        -r 5 \
-        -c:v libx264 -preset veryfast -crf 26 \
-        -maxrate 400k -bufsize 800k \
-        -profile:v high -pix_fmt yuv420p \
-        -g 5 -keyint_min 5 -sc_threshold 0 \
+        -vf "$VIDEO_FILTER" \
+        -r "$RECORD_FPS" \
+        "${VIDEO_ENCODER_ARGS[@]}" \
         -an \
         -movflags +faststart \
         -y "$out"
@@ -1794,6 +1919,9 @@ _reap_stale_ffmpeg 0
 
 _detect_rtsp_timeout_flag
 log "ffmpeg RTSP timeout: ${FFMPEG_RTSP_TIMEOUT_ARGS[*]:-none}"
+
+_detect_video_encoder
+log "Video encoder: ${VIDEO_ENCODER_NAME} — ${RECORD_FPS}fps, max ${RECORD_MAXRATE} (bufsize ${RECORD_BUFSIZE}), keyframe every ${RECORD_GOP_SEC}s"
 
 _container_state=$(_ensure_container)
 _container_access="${_container_state#*:}"

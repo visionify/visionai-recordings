@@ -332,18 +332,50 @@ is used instead.
 
 ### Video Settings
 
-Recordings are optimised for computer vision — frame extraction and annotation:
+Recordings serve two audiences — CV frame extraction and humans reviewing what
+happened — so the defaults target smooth motion as well as per-frame detail:
 
-| Setting | Value | Purpose |
-|---------|-------|---------|
+| Setting | Default | Purpose |
+|---------|---------|---------|
 | Resolution | max 720p | Sufficient for CV, keeps file size manageable |
-| Frame rate | 15 fps | 1 frame per 67ms — good temporal resolution |
-| Codec | H.264 (CRF 20) | High quality, universally compatible |
+| Frame rate | 10 fps | 5 fps is fine for pulling stills but reads as a slideshow when watched: a walking person moves ~30cm between frames |
+| Codec | H.264 (CRF 26, capped at 800k) | Quality-driven; the cap only binds on motion |
 | Pixel format | `yuv420p` | Compatible with OpenCV, PyTorch, YOLO etc. |
-| Keyframe interval | every 1s | Fast random seeking during frame extraction |
+| Keyframe interval | every 5s | Frame extraction decodes sequentially, so a tight GOP only spends bitrate on redundant keyframes |
 | Audio | none | Not needed for CV |
 
-Expected file size: **150–400 MB** per 30-minute recording.
+Expected file size: **90–180 MB** per 30-minute recording, the upper end only
+for continuously busy scenes.
+
+The bitrate ceiling matches the macOS manager (`-maxrate 800k`), so recordings
+are comparable across platforms.
+
+#### Hardware encoding
+
+The encoder is chosen at startup and logged as `Video encoder: …`. `auto` tries
+NVENC, then VAAPI, then software x264. Each candidate is **functionally probed**
+by encoding a few synthetic frames — an encoder can be compiled into ffmpeg and
+still fail for want of a driver, a device node, or permissions, so presence in
+`ffmpeg -encoders` proves nothing.
+
+Offloading to a GPU is what lets a device raise frame rate and motion quality at
+the same time. On software x264 those trade against each other: the preset that
+tracks a moving person properly is the one that could not keep up with the input
+rate, and a capture that falls behind gets cut off by its deadline.
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `RECORD_ENCODER` | `auto` | `auto`, `nvenc`, `vaapi`, or `software`. A named encoder that fails its probe logs a warning and falls back |
+| `RECORD_VAAPI_DEVICE` | first `/dev/dri/renderD*` | Render node for VAAPI |
+| `RECORD_FPS` | `10` | Capture frame rate |
+| `RECORD_MAXRATE` | `800k` | Bitrate ceiling |
+| `RECORD_BUFSIZE` | 2× maxrate | VBV window |
+| `RECORD_CRF` | `26` | Quality target (`-cq` on NVENC; VAAPI has no CRF and runs VBR at 60% of the ceiling) |
+| `RECORD_GOP_SEC` | `5` | Keyframe interval in seconds |
+| `RECORD_X264_PRESET` | `veryfast` | Software preset only. Slower tracks motion better, but `medium` once could not sustain the input rate and captures were truncated — raise only on a device you have measured |
+
+Dial `RECORD_FPS` back down on a device that cannot keep up; the log line at
+startup tells you which encoder it actually got.
 
 ### Backend version (v1 dashboard or v2 app)
 
