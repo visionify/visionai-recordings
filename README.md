@@ -244,6 +244,8 @@ Required `.env` variables:
 ```env
 VISIONAI_API_ENDPOINT=http://<host>:<port>/api
 VISIONAI_API_TOKEN=...
+# Only for STORAGE_MODE=key (the v1 dashboard). The v2 app brokers uploads —
+# see "Storage: broker or key" below — and then no storage secret is needed.
 EVENTS_AZURE_BLOB_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...
 ```
 
@@ -306,7 +308,54 @@ sudo systemctl restart visionai-recording-manager
 sudo systemctl stop visionai-recording-manager
 ```
 
-### Azure Blob File Structure
+### Storage: broker or key
+
+The manager has two ways of getting a recording into Azure Blob, chosen by
+`STORAGE_MODE` (default `auto`) and logged at startup as `Storage mode: …`.
+
+| Mode | How the upload is authorised | Needs on the device |
+|------|------------------------------|---------------------|
+| `broker` | The v2 app's storage broker (`POST /storage/upload-token`) issues a SAS for **one blob, create+write only, ten minutes**. The manager PUTs the file to it with curl and reports the bare `recordings/<blob>` path on completion. | Nothing but the API token. No storage key, no Python SDK. |
+| `key` | `EVENTS_AZURE_BLOB_CONNECTION_STRING` and the Azure SDK, as the v1 dashboard requires. The manager signs the URL it reports. | The connection string and `azure-storage-blob` in the venv. |
+| `auto` | `broker` when the backend is v2 and answers `GET /storage/config`, otherwise `key`. | — |
+
+The broker is the same one `visionai-inference` uses (its client is
+`services/storage_broker.py`; the contract is
+`docs/MEDIA_STORAGE_API_SPEC.md` in that repo, the server is
+`api/src/lib/storage-broker.ts` in `visionai-app`). What it buys: a device
+holds no credential that could read, list or delete anything, a compromised
+box can only write under its own tenant prefix for ten minutes at a time, and
+each site's footage lands in the storage account its region requires without
+the device knowing which one that is. The API mints playback links from the
+stored path (`GET /recordings/:id/playback-url`), so nothing long-lived is
+ever written into a recording row.
+
+Under the broker the API asserts the path's tenant prefix, so the blob layout
+differs from key mode:
+
+```
+recordings/                       ← container
+  <company>/<site>/               ← display names, sanitised like the API does
+    raw/
+      <camera>-<YYYYMMDD-HHMMSS>.mp4
+      <camera>-<YYYYMMDD-HHMMSS>_thumb.jpg
+```
+
+`BROKER_BLOB_PREFIX` (default `raw`) is the segment under the tenant; the
+key-mode `AZURE_BLOB_PREFIX` does not apply here.
+
+The names come from `GET /token-details`; `VISIONAI_COMPANY_NAME` and
+`VISIONAI_SITE_NAME` in the env file override them. A grant the API refuses is
+logged with its error code (`PATH_NOT_ALLOWED`, `CONTAINER_NOT_ALLOWED`, …)
+and the file is spooled like any other failed upload. `recordings` must be in
+the API's `STORAGE_ALLOWED_CONTAINERS` (it is by default); the startup log warns
+if `/storage/config` does not list it.
+
+Broker-side knobs: `BROKER_UPLOAD_MIN_BPS` / `BROKER_UPLOAD_STALL_SEC` (default
+1024 bytes/s for 60s) abandon a stalled PUT so the next attempt gets a fresh
+grant; `UPLOAD_RETRIES` / `UPLOAD_RETRY_DELAY` apply as in key mode.
+
+### Azure Blob File Structure (key mode)
 
 Each recording is a single file (no segments), stored in the **`recordings`**
 container under a `raw-recordings/<site_uuid>/` prefix:
@@ -395,6 +444,7 @@ the one extra request per start.
 |---|---|---|
 | Poll | `GET /v2/get-recording-status?recording_type=raw` | `GET /recordings/poll` |
 | Complete | `POST /v2/update-recording-url` (id in body) | `POST /recordings/<id>/complete` |
+| Thumbnail | `_thumb.jpg` uploaded, not reported | `thumbnail_blob_path` in the complete body — the clip's own poster on the Recordings page |
 | Token context | `GET /v2/token-context` | `GET /token-context` (site_uuid only) |
 | Camera RTSP | in the poll response | `GET /v2/inference/cameras`, cached `CAMERA_MAP_TTL` |
 | Stop signal | recording absent for 2 polls | row reported with `status: "stopped"` |

@@ -28,7 +28,19 @@
 #
 # ── Daemon env vars (set in ENV_FILE) ────────────────────────────────────────
 #   Required: VISIONAI_API_ENDPOINT  VISIONAI_API_TOKEN
-#             EVENTS_AZURE_BLOB_CONNECTION_STRING
+#
+#   Storage — how recordings reach Azure Blob (STORAGE_MODE, default auto):
+#     broker  The v2 app hands out a write-only SAS per blob (POST
+#             /storage/upload-token); the device holds NO storage credential and
+#             needs no Python. Requires the v2 backend.
+#     key     Uploads with EVENTS_AZURE_BLOB_CONNECTION_STRING via the Azure
+#             SDK, as before. The only option on the v1 dashboard.
+#     auto    broker when the backend is v2 and answers GET /storage/config,
+#             otherwise key. Set explicitly to pin one.
+#   Under broker the path is <company>/<site>/raw/<file>; the
+#   names come from GET /token-details, or VISIONAI_COMPANY_NAME /
+#   VISIONAI_SITE_NAME in the env file when set.
+#
 #   Optional: POLL_INTERVAL (default 300s)
 #             UPLOAD_RETRIES (default 3)   UPLOAD_RETRY_DELAY (default 10s)
 #             PYTHON_BIN  DEBUG  ENV_FILE  LOG_FILE
@@ -121,15 +133,20 @@ if [[ "${1:-}" == "install" || "${1:-}" == "--install" ]]; then
         ok "Venv already exists: $VENV_DIR"
     fi
 
+    # Needed only for STORAGE_MODE=key (uploads with the account key). Under the
+    # v2 storage broker the daemon uploads with curl and this is never imported,
+    # so a failed install is a warning: the daemon says at startup which mode it
+    # resolved and whether the SDK is missing for it.
     if "$VENV_DIR/bin/python3" -c "from azure.storage.blob import BlobServiceClient" 2>/dev/null; then
         ok "azure-storage-blob already installed"
     else
-        warn "Installing azure-storage-blob into venv..."
-        "$VENV_DIR/bin/pip" install --quiet azure-storage-blob \
-            || err "pip install azure-storage-blob failed — check your network and try again"
-        "$VENV_DIR/bin/python3" -c "from azure.storage.blob import BlobServiceClient" 2>/dev/null \
-            || err "azure-storage-blob not importable after install"
-        ok "azure-storage-blob installed"
+        warn "Installing azure-storage-blob into venv (needed for connection-string uploads)..."
+        if "$VENV_DIR/bin/pip" install --quiet azure-storage-blob \
+            && "$VENV_DIR/bin/python3" -c "from azure.storage.blob import BlobServiceClient" 2>/dev/null; then
+            ok "azure-storage-blob installed"
+        else
+            warn "azure-storage-blob install failed — key-based uploads unavailable; the v2 storage broker does not need it"
+        fi
     fi
 
     # firebase-admin enables the optional push listener (near-instant start/stop).
@@ -382,18 +399,37 @@ RECORD_VAAPI_DEVICE=${RECORD_VAAPI_DEVICE:-}   # empty: first /dev/dri/renderD*
 #   v2: GET /recordings/poll                POST /recordings/<id>/complete
 VISIONAI_API_VERSION=${VISIONAI_API_VERSION:-auto}
 API_VERSION=""            # resolved at startup
+# How long to wait for an unreachable API at startup before guessing. Six
+# tries twenty seconds apart rides out the kind of uplink flap that made a v2
+# site with a pinned broker exit as "v1 has no broker".
+API_PROBE_RETRIES=${API_PROBE_RETRIES:-6}
+API_PROBE_RETRY_DELAY=${API_PROBE_RETRY_DELAY:-20}
 # v2's poll reports camera_id but not camera_url, so the RTSP address is looked
 # up from /v2/inference/cameras and cached for this long.
 CAMERA_MAP_TTL=${CAMERA_MAP_TTL:-300}
 CAMERA_MAP_JSON=""
 CAMERA_MAP_AT=0
-# Azure Blob layout: <container>/<prefix>/<site_uuid>/<camera>-<timestamp>.mp4
+# Azure Blob layout, key mode:  <container>/<prefix>/<site_uuid>/<camera>-<ts>.mp4
+# Under the broker the API asserts a tenant prefix instead:
+#                               <container>/<company>/<site>/raw/<camera>-<ts>.mp4
 AZURE_CONTAINER=${AZURE_CONTAINER:-recordings}
-AZURE_BLOB_PREFIX=${AZURE_BLOB_PREFIX:-raw-recordings}
+AZURE_BLOB_PREFIX=${AZURE_BLOB_PREFIX:-raw-recordings}   # key mode, under the container root
+BROKER_BLOB_PREFIX=${BROKER_BLOB_PREFIX:-raw}           # broker mode, under <company>/<site>/
+# How uploads are authorised — see the header. Resolved at startup, after the
+# backend version is known, into "broker" or "key".
+STORAGE_MODE=${STORAGE_MODE:-auto}
+# Grant TTL is the API's (600s by default); a stalled PUT is abandoned once it
+# drops below this rate for this long, and the next attempt asks for a fresh grant.
+BROKER_UPLOAD_MIN_BPS=${BROKER_UPLOAD_MIN_BPS:-1024}
+BROKER_UPLOAD_STALL_SEC=${BROKER_UPLOAD_STALL_SEC:-60}
 # Resolved at startup from /v2/token-context (the token is opaque to us).
 CLIENT_SITE_ID=""
 CLIENT_SITE_NAME=""
 CLIENT_SITE_UUID=""
+# Broker tenant prefix, from /token-details (v2) — display names, sanitised the
+# way the API sanitises them before it asserts the prefix.
+CLIENT_COMPANY_SEG=""
+CLIENT_SITE_SEG=""
 CLIENT_FIREBASE_PATH=""   # recording-commands/{site_uuid} — listener scope
 
 mkdir -p "$(dirname "$LOG_FILE")" "$TMP_DIR" "$ACTIVE_DIR" "$SPOOL_DIR" "$DURATION_DIR"
@@ -429,15 +465,20 @@ else
     log_warn "Env file not found at $ENV_FILE — using existing environment"
 fi
 
+# The connection string is checked later, once the storage mode is resolved:
+# under the broker the device is not supposed to hold one.
 _check_vars() {
     local missing=()
-    for v in VISIONAI_API_ENDPOINT VISIONAI_API_TOKEN \
-              EVENTS_AZURE_BLOB_CONNECTION_STRING; do
+    for v in VISIONAI_API_ENDPOINT VISIONAI_API_TOKEN; do
         [[ -z "${!v:-}" ]] && missing+=("$v")
     done
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "Missing required variables: ${missing[*]}"; exit 1
     fi
+    case "$STORAGE_MODE" in
+        auto|broker|key) ;;
+        *) log_error "STORAGE_MODE must be auto, broker or key (got '$STORAGE_MODE')"; exit 1 ;;
+    esac
 }
 _check_vars
 
@@ -469,11 +510,7 @@ if [[ "$CDN_PUBLIC_URLS" == "1" && -z "$CDN_BASE_URL" ]]; then
     log_warn "CDN_PUBLIC_URLS=1 but no CDN base URL configured — falling back to signed URLs"
     CDN_PUBLIC_URLS=0
 fi
-if [[ "$CDN_PUBLIC_URLS" == "1" ]]; then
-    log "URL style: permanent CDN links via ${CDN_BASE_URL}"
-else
-    log "URL style: signed links (expire after ${AZURE_SAS_EXPIRY_DAYS}d)"
-fi
+# (The URL style is logged from _init_key_storage: it only applies in key mode.)
 
 for _cmd in jq ffmpeg curl; do
     command -v "$_cmd" >/dev/null 2>&1 || { log_error "$_cmd not found — install it first"; exit 1; }
@@ -497,12 +534,14 @@ _find_python() {
     done
     echo ""
 }
+# Not fatal here: only key-mode uploads need the SDK, and the mode is not known
+# until the backend has been probed. _init_key_storage refuses to start without it.
 PYTHON_BIN=$(_find_python)
-if [[ -z "$PYTHON_BIN" ]]; then
-    log_error "No Python 3 with azure-storage-blob found — run: pip3 install azure-storage-blob"
-    exit 1
+if [[ -n "$PYTHON_BIN" ]]; then
+    log "Using Python: $PYTHON_BIN (azure-storage-blob available)"
+else
+    log "No Python 3 with azure-storage-blob found — key-based uploads unavailable (fine under the v2 storage broker)"
 fi
-log "Using Python: $PYTHON_BIN (azure-storage-blob available)"
 
 # ---- Locate a Python 3 with firebase_admin (optional push listener) -----
 # Returns a python path with firebase_admin importable, or "" if none.
@@ -585,21 +624,33 @@ _api_post() {
 # short-lived playback URL from it on demand, so the long-lived SAS URL in
 # azure_url stops being the thing the archive depends on. azure_url is still
 # sent for older backends that have no blob_path column.
+# $9 is the poster frame's blob path in the same form, or "" when no thumbnail
+# was uploaded. The v2 app stores it as the recording's own thumbnail; without
+# it the Recordings page used to show the camera's live snapshot for every
+# clip. Sent as null when empty; older backends ignore the field.
 _api_update() {
     local recording_id="$1" azure_url="$2" status="$3"
     local start_time="${4:-}" stop_time="${5:-}" duration="${6:-0}" camera_id="${7:-0}"
-    local blob_path="${8:-}"
+    local blob_path="${8:-}" thumb_blob_path="${9:-}"
     local body resp
+    # Under the broker the device cannot sign a read URL and nothing durable
+    # should hold one: the blob path is the whole reference, and the API mints
+    # playback links from it. The upload helpers echo a placeholder there.
+    [[ "$STORAGE_MODE" == "broker" ]] && azure_url=""
     body=$(jq -n \
         --argjson rid "$recording_id" \
         --arg     url "$azure_url" \
         --arg     bp  "$blob_path" \
+        --arg     tbp "$thumb_blob_path" \
         --arg     st  "$status" \
         --arg     start "$start_time" \
         --arg     stop  "$stop_time" \
         --argjson dur   "$duration" \
         --argjson cid   "$camera_id" \
-        '{recording_id:$rid,azure_url:$url,blob_path:$bp,status:$st,
+        '{recording_id:$rid,azure_url:(if $url == "" then null else $url end),
+          blob_path:$bp,
+          thumbnail_blob_path:(if $tbp == "" then null else $tbp end),
+          status:$st,
           start_time:$start,stop_time:$stop,duration:$dur,camera_id:$cid}')
     local url="${VISIONAI_API_ENDPOINT}/v2/update-recording-url"
     [[ "$API_VERSION" == "v2" ]] && url="${VISIONAI_API_ENDPOINT}/recordings/${recording_id}/complete"
@@ -632,26 +683,133 @@ _detect_api_version() {
         return
     fi
 
-    local body
-    body=$(_api_get "${VISIONAI_API_ENDPOINT}/recordings/poll" 10 2>/dev/null) || body=""
-    if [[ -n "$body" ]] && echo "$body" | jq -e 'has("data") and (.data | type == "array")' >/dev/null 2>&1; then
-        API_VERSION="v2"
-        log "API version: v2 (detected — /recordings/poll answered)"
-        return
-    fi
+    # A site on a flapping uplink can miss both probes at boot. That is not
+    # "v1" and it is not "no broker": it is nothing yet. Wait for the link
+    # rather than guessing, because a wrong guess here pins the wrong storage
+    # mode for the life of the process.
+    local attempt=1 body code
+    while :; do
+        body=$(_api_get "${VISIONAI_API_ENDPOINT}/recordings/poll" 10 2>/dev/null) || body=""
+        if [[ -n "$body" ]] && echo "$body" | jq -e 'has("data") and (.data | type == "array")' >/dev/null 2>&1; then
+            API_VERSION="v2"
+            log "API version: v2 (detected — /recordings/poll answered)"
+            return
+        fi
 
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
-        -H "Token: $VISIONAI_API_TOKEN" \
-        "${VISIONAI_API_ENDPOINT}/v2/get-recording-status?recording_type=raw" 2>/dev/null)
-    if [[ "$code" == "200" || "$code" == "404" ]]; then
-        API_VERSION="v1"
-        log "API version: v1 (detected — /v2/get-recording-status answered HTTP $code)"
-        return
-    fi
+        code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+            -H "Token: $VISIONAI_API_TOKEN" \
+            "${VISIONAI_API_ENDPOINT}/v2/get-recording-status?recording_type=raw" 2>/dev/null)
+        if [[ "$code" == "200" || "$code" == "404" ]]; then
+            API_VERSION="v1"
+            log "API version: v1 (detected — /v2/get-recording-status answered HTTP $code)"
+            return
+        fi
+
+        if [[ "${code:-000}" == "000" && $attempt -lt $API_PROBE_RETRIES ]]; then
+            log_warn "API unreachable at ${VISIONAI_API_ENDPOINT} (attempt $attempt/$API_PROBE_RETRIES) — retrying in ${API_PROBE_RETRY_DELAY}s"
+            attempt=$(( attempt + 1 ))
+            sleep "$API_PROBE_RETRY_DELAY"
+            continue
+        fi
+        break
+    done
 
     API_VERSION="v1"
     log_error "Could not determine API version (v2 poll silent, v1 status HTTP ${code:-000}) — assuming v1. Set VISIONAI_API_VERSION to override."
+}
+
+# ---- Storage mode: broker (v2 write grants) or key (connection string) ---
+# GET /storage/config is the broker's bootstrap call; 200 means this backend
+# brokers uploads for this token. Anything else (404 on v1, 403 for a token
+# without the edge-telemetry permission, an outage) means it does not, or not
+# right now — "auto" then falls back to the key if one is configured.
+_broker_available() {
+    local tmp http_code
+    [[ "$API_VERSION" == "v2" ]] || return 1
+    tmp=$(mktemp)
+    http_code=$(curl -s -o "$tmp" -w "%{http_code}" --max-time 10 \
+        -H "Token: $VISIONAI_API_TOKEN" "${VISIONAI_API_ENDPOINT}/storage/config" 2>/dev/null)
+    BROKER_CONFIG_JSON=$(cat "$tmp" 2>/dev/null); rm -f "$tmp"
+    BROKER_CONFIG_HTTP="$http_code"
+    [[ "$http_code" == "200" ]] && echo "$BROKER_CONFIG_JSON" | jq -e '.backend' >/dev/null 2>&1
+}
+
+_init_broker_storage() {
+    local account containers
+    account=$(echo "$BROKER_CONFIG_JSON" | jq -r '.account_name // .account_url // "?"' 2>/dev/null)
+    containers=$(echo "$BROKER_CONFIG_JSON" | jq -r '.allowed_containers // [] | join(",")' 2>/dev/null)
+    if ! echo "$BROKER_CONFIG_JSON" | jq -e --arg c "$AZURE_CONTAINER" \
+            '.allowed_containers // [] | index($c) != null' >/dev/null 2>&1; then
+        # Not fatal: the list advertised is a hint, the grant request is the
+        # authority. But every grant WILL be refused until the API is told.
+        log_warn "Container '${AZURE_CONTAINER}' is not in the API's allowed containers [${containers}] — add it to STORAGE_ALLOWED_CONTAINERS on the API or uploads will be refused"
+    fi
+    if ! _fetch_tenant_names; then
+        log_error "Storage broker needs the tenant names for the blob prefix, but /token-details gave none — set VISIONAI_COMPANY_NAME and VISIONAI_SITE_NAME in $ENV_FILE"
+        exit 1
+    fi
+    log "Storage: broker — write grants from ${VISIONAI_API_ENDPOINT}/storage/upload-token, account=${account}, prefix=${AZURE_CONTAINER}/${CLIENT_COMPANY_SEG}/${CLIENT_SITE_SEG}/${BROKER_BLOB_PREFIX}/ (no storage key on this device)"
+    if [[ -n "${EVENTS_AZURE_BLOB_CONNECTION_STRING:-}" ]]; then
+        log_warn "EVENTS_AZURE_BLOB_CONNECTION_STRING is set but unused under the broker — it can be removed from $ENV_FILE"
+    fi
+}
+
+_init_key_storage() {
+    if [[ -z "${EVENTS_AZURE_BLOB_CONNECTION_STRING:-}" ]]; then
+        log_error "Storage: key mode needs EVENTS_AZURE_BLOB_CONNECTION_STRING in $ENV_FILE (the ${API_VERSION} backend at ${VISIONAI_API_ENDPOINT} offers no broker: /storage/config HTTP ${BROKER_CONFIG_HTTP:-not probed})"
+        exit 1
+    fi
+    if [[ -z "$PYTHON_BIN" ]]; then
+        log_error "Storage: key mode needs a Python 3 with azure-storage-blob — run: /opt/visionai/.venv/bin/pip install azure-storage-blob"
+        exit 1
+    fi
+    if [[ "$CDN_PUBLIC_URLS" == "1" ]]; then
+        log "Storage: key — SDK uploads with the account key; URL style: permanent CDN links via ${CDN_BASE_URL}"
+    else
+        log "Storage: key — SDK uploads with the account key; URL style: signed links (expire after ${AZURE_SAS_EXPIRY_DAYS}d)"
+    fi
+
+    local state access
+    state=$(_ensure_container)
+    access="${state#*:}"
+    log "Azure container ready (${AZURE_CONTAINER}/${AZURE_BLOB_PREFIX}/, access=${access:-unknown})"
+
+    # Permanent URLs carry no token, so the object has to be readable without one.
+    # Say so up front rather than letting the probe fail with no explanation.
+    if [[ "$CDN_PUBLIC_URLS" == "1" && "$access" == "private" ]]; then
+        log_warn "Container '${AZURE_CONTAINER}' is private but permanent CDN URLs are on — these resolve only if ${CDN_BASE_URL} authenticates to its origin. If the probe below fails, either set the container's public access to 'blob' or leave CDN_PUBLIC_URLS=0."
+    fi
+    # Confirm permanent CDN links actually resolve before any recording is
+    # written with one; falls back to signed URLs if they don't.
+    _probe_public_url
+}
+
+BROKER_CONFIG_JSON=""
+BROKER_CONFIG_HTTP=""
+_resolve_storage_mode() {
+    case "$STORAGE_MODE" in
+        broker)
+            if ! _broker_available; then
+                log_error "STORAGE_MODE=broker but the ${API_VERSION} backend at ${VISIONAI_API_ENDPOINT} does not broker uploads (/storage/config HTTP ${BROKER_CONFIG_HTTP:-000}) — the broker exists on the v2 app only"
+                exit 1
+            fi
+            ;;
+        key) ;;
+        auto)
+            if _broker_available; then
+                STORAGE_MODE="broker"
+                log "Storage mode: broker (auto — v2 answered /storage/config)"
+            else
+                STORAGE_MODE="key"
+                log "Storage mode: key (auto — /storage/config HTTP ${BROKER_CONFIG_HTTP:-000}${API_VERSION:+ on $API_VERSION})"
+            fi
+            ;;
+    esac
+    if [[ "$STORAGE_MODE" == "broker" ]]; then
+        _init_broker_storage
+    else
+        _init_key_storage
+    fi
 }
 
 # ---- camera_id -> rtsp, for v2 ------------------------------------------
@@ -685,8 +843,11 @@ _fetch_site_context() {
     [[ "$API_VERSION" == "v2" ]] && path="/token-context"
     resp=$(_api_get "${VISIONAI_API_ENDPOINT}${path}" 10 2>/dev/null) || resp=""
     if [[ -n "$resp" ]]; then
+        local _name
         CLIENT_SITE_ID=$(echo "$resp"   | jq -r '.site_id   // empty' 2>/dev/null)
-        CLIENT_SITE_NAME=$(echo "$resp" | jq -r '.site_name // empty' 2>/dev/null)
+        # v2 carries no site_name here; keep the one /token-details gave the broker.
+        _name=$(echo "$resp" | jq -r '.site_name // empty' 2>/dev/null)
+        [[ -n "$_name" ]] && CLIENT_SITE_NAME="$_name"
         CLIENT_SITE_UUID=$(echo "$resp" | jq -r '.site_uuid // empty' 2>/dev/null)
     else
         log_warn "${path} unavailable — check VISIONAI_API_ENDPOINT/TOKEN"
@@ -806,6 +967,168 @@ PYEOF
 
 _file_size() { stat -c%s "$1" 2>/dev/null || echo 0; }
 
+# ---- Storage broker (v2): per-blob write grants, no account key ---------
+#
+# Mirrors services/storage_broker.py + azure_blob_utils._upload_via_broker in
+# visionai-inference, in curl. The device asks POST /storage/upload-token for a
+# SAS scoped to one blob (create+write, ten minutes), PUTs the file to it, and
+# reports "<container>/<blob>". The API validates the path against the token's
+# tenant prefix, re-signs reads on demand, and files the reference under the
+# site's own regional storage account — none of which this daemon has to know.
+
+# One path segment, made safe exactly the way the API's sanitizeSegment and the
+# inference service's sanitize_path_segment do it. The prefix the API asserts
+# is built with ITS copy from the tenant's display names, so any drift here
+# turns into 403 PATH_NOT_ALLOWED on every upload.
+_sanitize_segment() {
+    local value="${1:-}" fallback="${2:-unknown}" max="${3:-80}" seg
+    seg=$(printf '%s' "$value" | LC_ALL=C sed -E 's/[^0-9A-Za-z._-]+/-/g; s/-{2,}/-/g; s/^[-.]+//; s/[-.]+$//')
+    [[ -z "$seg" ]] && { echo "$fallback"; return; }
+    echo "${seg:0:$max}"
+}
+
+# Content type is pinned by the API from the extension; send the same one so
+# the stored blob and the signed read agree.
+_content_type_for() {
+    case "${1##*.}" in
+        mp4) echo "video/mp4" ;;
+        jpg|jpeg) echo "image/jpeg" ;;
+        png) echo "image/png" ;;
+        json) echo "application/json" ;;
+        txt|log) echo "text/plain" ;;
+        *) echo "application/octet-stream" ;;
+    esac
+}
+
+# Fetch the tenant names the prefix is built from. .env overrides win, for a
+# device whose token-details is unreachable or whose site was renamed mid-run.
+_fetch_tenant_names() {
+    local resp company site
+    if [[ -z "${VISIONAI_COMPANY_NAME:-}" || -z "${VISIONAI_SITE_NAME:-}" ]]; then
+        resp=$(_api_get "${VISIONAI_API_ENDPOINT}/token-details" 10 2>/dev/null) || resp=""
+        company=$(echo "$resp" | jq -r '.data.company_name // empty' 2>/dev/null)
+        site=$(echo "$resp"    | jq -r '.data.site_name    // empty' 2>/dev/null)
+    fi
+    [[ -n "${VISIONAI_COMPANY_NAME:-}" ]] && company="$VISIONAI_COMPANY_NAME"
+    [[ -n "${VISIONAI_SITE_NAME:-}"    ]] && site="$VISIONAI_SITE_NAME"
+    [[ -z "$company" || -z "$site" ]] && return 1
+    CLIENT_COMPANY_SEG=$(_sanitize_segment "$company" "company")
+    CLIENT_SITE_SEG=$(_sanitize_segment "$site" "site")
+    # The name label used in logs and (in key mode) the folder — keep in step.
+    [[ -z "$CLIENT_SITE_NAME" ]] && CLIENT_SITE_NAME="$site"
+    return 0
+}
+
+# Ask for one write grant. Echoes the upload URL, or nothing. Prints the API's
+# error envelope on stderr so the caller can tell a terminal rejection (a
+# path the tenant may not write — configuration, not weather) from a blip.
+_broker_grant() {
+    local blob_path="$1" size="$2" kind="${3:-raw-video}"
+    local body tmp http_code resp
+    # event_id is informational to the API; the file stem is unique per capture.
+    local stem; stem=$(basename "$blob_path"); stem="${stem%.*}"
+    body=$(jq -n --arg eid "recording-${stem}" \
+                 --arg bp "$blob_path" --arg kind "$kind" --arg c "$AZURE_CONTAINER" \
+                 --argjson sz "$size" \
+        '{event_id:$eid, blobs:[{blob_path:$bp, kind:$kind, size_bytes:$sz, container:$c}]}')
+    tmp=$(mktemp)
+    http_code=$(curl -s -o "$tmp" -w "%{http_code}" --max-time 30 -X POST \
+        -H "Content-Type: application/json" -H "Token: $VISIONAI_API_TOKEN" \
+        -d "$body" "${VISIONAI_API_ENDPOINT}/storage/upload-token" 2>/dev/null)
+    resp=$(cat "$tmp" 2>/dev/null); rm -f "$tmp"
+
+    if [[ "$http_code" == "200" ]]; then
+        local url
+        url=$(echo "$resp" | jq -r --arg bp "$blob_path" \
+            '.grants[]? | select(.blob_path == $bp) | .upload_url // empty' 2>/dev/null | head -1)
+        [[ -n "$url" ]] && { echo "$url"; return 0; }
+        echo "HTTP 200 but no grant for $blob_path: ${resp:0:200}" >&2
+        return 1
+    fi
+    local code msg retry
+    code=$(echo "$resp"  | jq -r '.error.code // "UNKNOWN"' 2>/dev/null)
+    msg=$(echo "$resp"   | jq -r '.error.message // empty' 2>/dev/null)
+    # Not `// empty`: jq's alternative operator treats false as absent, and
+    # false is the one value that matters here.
+    retry=$(echo "$resp" | jq -r '.error.retryable | if . == null then empty else tostring end' 2>/dev/null)
+    echo "HTTP ${http_code:-000} ${code:-UNKNOWN}${msg:+: $msg}${retry:+ (retryable=$retry)}" >&2
+    return 1
+}
+
+# PUT one file to a granted URL. 201 is success; 409 BlobAlreadyExists is
+# treated as success too (If-None-Match: * — a retry after a lost response
+# must not clobber, and an existing blob under a unique path IS this upload).
+_broker_put() {
+    local file="$1" url="$2" ctype="$3"
+    local http_code errbody tmp
+    tmp=$(mktemp)
+    http_code=$(curl -s -o "$tmp" -w "%{http_code}" -X PUT \
+        --speed-limit "$BROKER_UPLOAD_MIN_BPS" --speed-time "$BROKER_UPLOAD_STALL_SEC" \
+        -H "x-ms-blob-type: BlockBlob" \
+        -H "Content-Type: $ctype" \
+        -H "x-ms-blob-content-type: $ctype" \
+        -H "x-ms-blob-content-disposition: inline" \
+        -H "If-None-Match: *" \
+        --upload-file "$file" "$url" 2>/dev/null)
+    errbody=$(tr -d '\n' < "$tmp" 2>/dev/null | sed -E 's/<[^>]+>/ /g' | tr -s ' ' | cut -c1-200)
+    rm -f "$tmp"
+    # Both outcomes speak on stderr; the caller decides what to log with it.
+    case "$http_code" in
+        201) return 0 ;;
+        409) echo "blob already exists — treating as uploaded (${errbody:-BlobAlreadyExists})" >&2; return 0 ;;
+        *)   echo "PUT HTTP ${http_code:-000}${errbody:+: $errbody}" >&2; return 1 ;;
+    esac
+}
+
+# Broker counterpart of _azure_upload: same contract (echo non-empty on
+# success, "" after every retry failed). A fresh grant per attempt, so a retry
+# after a slow first attempt never runs into the old grant's expiry.
+_broker_upload() {
+    local file="$1" blob_name="$2" kind="${3:-raw-video}"
+    local attempt=1 size ctype url err
+    size=$(_file_size "$file")
+    ctype=$(_content_type_for "$blob_name")
+
+    while [[ $attempt -le $UPLOAD_RETRIES ]]; do
+        if url=$(_broker_grant "$blob_name" "$size" "$kind" 2>"${file}.grant.err"); then
+            if err=$(_broker_put "$file" "$url" "$ctype" 2>&1); then
+                rm -f "${file}.grant.err"
+                [[ -n "$err" ]] && log_warn "Broker upload of $blob_name: $err" >&2
+                echo "broker:${AZURE_CONTAINER}/${blob_name}"
+                return
+            fi
+            log_warn "Broker upload failed for $blob_name (attempt $attempt/$UPLOAD_RETRIES): ${err}" >&2
+        else
+            err=$(cat "${file}.grant.err" 2>/dev/null)
+            log_warn "Upload grant refused for $blob_name (attempt $attempt/$UPLOAD_RETRIES): ${err}" >&2
+            # A terminal rejection will not change by asking again in ten
+            # seconds. Stop retrying now; the spool retries on later polls, and
+            # the log line above names the reason for whoever fixes the config.
+            if echo "$err" | grep -q "retryable=false"; then
+                log_error "Broker rejected $blob_name as not allowed — check the tenant prefix (company/site names) and STORAGE_ALLOWED_CONTAINERS on the API" >&2
+                break
+            fi
+        fi
+        attempt=$(( attempt + 1 ))
+        [[ $attempt -le $UPLOAD_RETRIES ]] && sleep "$UPLOAD_RETRY_DELAY"
+    done
+    rm -f "${file}.grant.err"
+    log_error "Broker upload permanently failed for $blob_name" >&2
+    echo ""
+}
+
+# The one upload entry point the recording lifecycle uses. Echoes a non-empty
+# value on success (a playable URL in key mode, a placeholder in broker mode —
+# _api_update blanks it) and "" on failure.
+_upload_file() {
+    local file="$1" blob_name="$2" kind="${3:-raw-video}"
+    if [[ "$STORAGE_MODE" == "broker" ]]; then
+        _broker_upload "$file" "$blob_name" "$kind"
+    else
+        _azure_upload "$file" "$blob_name"
+    fi
+}
+
 # ---- Upload spool: keep the bytes when the network refuses them --------
 #
 # An upload that exhausts its retries used to end with `rm -f "$rec_file"`,
@@ -881,13 +1204,14 @@ _spool_drain() {
         [[ -z "$rec_id" || -z "$blob_path" ]] && { log_warn "Spool: unusable sidecar $(basename "$meta") — dropping"; rm -f "$f" "$meta"; continue; }
 
         log "Spool: retrying upload for recording $rec_id"
-        url=$(_azure_upload "$f" "$blob_path") || url=""
+        url=$(_upload_file "$f" "$blob_path" "raw-video") || url=""
         [[ -z "$url" ]] && { log_warn "Spool: recording $rec_id still not uploadable — leaving spooled"; continue; }
 
         thumb=""
         [[ -n "$thumb_path" ]] && { thumb=$(_upload_thumb "$f" "$thumb_path") || thumb=""; }
         _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$duration" "$cam_id" \
-                    "${AZURE_CONTAINER}/${blob_path}"
+                    "${AZURE_CONTAINER}/${blob_path}" \
+                    "${thumb:+${AZURE_CONTAINER}/${thumb_path}}"
         log "Recording $rec_id: completed from spool — $blob_path"
         rm -f "$f" "$meta"
     done
@@ -1234,7 +1558,7 @@ _upload_thumb() {
     local tmp; tmp=$(mktemp /tmp/visionai_th_XXXXXX.jpg)
     ffmpeg -i "$seg" -frames:v 1 -f image2 -y "$tmp" >/dev/null 2>&1 || true
     if [[ -s "$tmp" ]]; then
-        _azure_upload "$tmp" "$blob_key"
+        _upload_file "$tmp" "$blob_key" "thumbnail"
         rm -f "$tmp"
     else
         rm -f "$tmp"; echo ""
@@ -1253,12 +1577,21 @@ _run_recording() {
     local rec_stamp; rec_stamp=$(date '+%Y%m%d-%H%M%S')
     local start_time; start_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     local rec_file="${TMP_DIR}/rec_${rec_id}.mp4"
-    # Blob layout: <prefix>/<site_uuid>/<camera>-<timestamp>.{mp4,jpg} inside the
-    # $AZURE_CONTAINER container. Falls back to the sanitized site name if the
-    # uuid couldn't be resolved from token-context.
-    local site_seg="${CLIENT_SITE_UUID:-${site_safe:-unknown-site}}"
-    local blob_path="${AZURE_BLOB_PREFIX}/${site_seg}/${cam_safe}-${rec_stamp}.mp4"
-    local thumb_path="${AZURE_BLOB_PREFIX}/${site_seg}/${cam_safe}-${rec_stamp}_thumb.jpg"
+    # Blob layout inside the $AZURE_CONTAINER container:
+    #   key:    <prefix>/<site_uuid>/<camera>-<timestamp>.{mp4,jpg}
+    #           (falls back to the sanitized site name without a uuid)
+    #   broker: <company>/<site>/raw/<camera>-<timestamp>.{mp4,jpg}
+    #           The API only grants paths under the token's tenant prefix.
+    local blob_path thumb_path
+    if [[ "$STORAGE_MODE" == "broker" ]]; then
+        local dir="${CLIENT_COMPANY_SEG}/${CLIENT_SITE_SEG}/${BROKER_BLOB_PREFIX}"
+        blob_path="${dir}/${cam_safe:-camera}-${rec_stamp}.mp4"
+        thumb_path="${dir}/${cam_safe:-camera}-${rec_stamp}_thumb.jpg"
+    else
+        local site_seg="${CLIENT_SITE_UUID:-${site_safe:-unknown-site}}"
+        blob_path="${AZURE_BLOB_PREFIX}/${site_seg}/${cam_safe}-${rec_stamp}.mp4"
+        thumb_path="${AZURE_BLOB_PREFIX}/${site_seg}/${cam_safe}-${rec_stamp}_thumb.jpg"
+    fi
     local stopflag="${ACTIVE_DIR}/${rec_id}.stop"
 
     log "Recording $rec_id: starting (cam=$cam_name, site=$site_name, ${dur_sec}s)"
@@ -1375,7 +1708,7 @@ _run_recording() {
     fi
 
     local stop_time; stop_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    local url; url=$(_azure_upload "$rec_file" "$blob_path") || url=""
+    local url; url=$(_upload_file "$rec_file" "$blob_path" "raw-video") || url=""
 
     # Upload failed after every retry. Keep the footage and try again on a later
     # poll rather than deleting it — the bytes are unrecoverable once dropped,
@@ -1396,8 +1729,12 @@ _run_recording() {
     local thumb; thumb=$(_upload_thumb "$rec_file" "$thumb_path") || thumb=""
     rm -f "$rec_file" "${rec_file}.err"
 
+    # Report the poster only if it actually uploaded — a path to a missing blob
+    # would be a broken image on the Recordings page, where no path is just
+    # the placeholder.
     _api_update "$rec_id" "$url" "completed" "$start_time" "$stop_time" "$report_dur" "$cam_id" \
-                "${AZURE_CONTAINER}/${blob_path}"
+                "${AZURE_CONTAINER}/${blob_path}" \
+                "${thumb:+${AZURE_CONTAINER}/${thumb_path}}"
     log "Recording $rec_id: completed — $blob_path (${sz}B)"
 
     rm -rf "${ACTIVE_DIR:?}/${rec_id}" "${stopflag}"; _duration_forget "$rec_id"
@@ -1776,7 +2113,11 @@ _poll_v2() {
     fi
 
     local rows
-    rows=$(echo "$resp" | jq -c '[.data[]? | select((.recording_type // "raw") == "raw")]' 2>/dev/null) || rows="[]"
+    # A row with no recording_type is an ordinary inference clip (that is how
+    # the API reads a null), so it is NOT ours. Defaulting it to "raw" here
+    # would have this daemon capture inference recordings alongside the
+    # inference service — the mirror image of the storelogs double capture.
+    rows=$(echo "$resp" | jq -c '[.data[]? | select((.recording_type // "inference") == "raw")]' 2>/dev/null) || rows="[]"
     local n; n=$(echo "$rows" | jq 'length' 2>/dev/null); n=${n:-0}
 
     # Stops first: a recording that ended should not be re-dispatched below.
@@ -1923,22 +2264,12 @@ log "ffmpeg RTSP timeout: ${FFMPEG_RTSP_TIMEOUT_ARGS[*]:-none}"
 _detect_video_encoder
 log "Video encoder: ${VIDEO_ENCODER_NAME} — ${RECORD_FPS}fps, max ${RECORD_MAXRATE} (bufsize ${RECORD_BUFSIZE}), keyframe every ${RECORD_GOP_SEC}s"
 
-_container_state=$(_ensure_container)
-_container_access="${_container_state#*:}"
-log "Azure container ready (${AZURE_CONTAINER}/${AZURE_BLOB_PREFIX}/, access=${_container_access:-unknown})"
-
-# Permanent URLs carry no token, so the object has to be readable without one.
-# Say so up front rather than letting the probe fail with no explanation.
-if [[ "$CDN_PUBLIC_URLS" == "1" && "$_container_access" == "private" ]]; then
-    log_warn "Container '${AZURE_CONTAINER}' is private but permanent CDN URLs are on — these resolve only if ${CDN_BASE_URL} authenticates to its origin. If the probe below fails, either set the container's public access to 'blob' or leave CDN_PUBLIC_URLS=0."
-fi
-
-# Confirm permanent CDN links actually resolve before any recording is written
-# with one; falls back to signed URLs if they don't.
-_probe_public_url
-
-# Which backend this site runs — decides every REST path below.
+# Which backend this site runs — decides every REST path below, and whether
+# the storage broker is even on offer.
 _detect_api_version
+
+# broker or key. Exits if neither can work with what this device has.
+_resolve_storage_mode
 
 # Resolve the site this token is scoped to (for Firebase scoping + labelling).
 _fetch_site_context
